@@ -1,0 +1,71 @@
+{
+  "name": "scaffold_python_fastapi",
+  "version": 1,
+  "description": "Scaffold a Python FastAPI service with uv, a health endpoint, and pytest.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": [
+    "python",
+    "fastapi",
+    "api",
+    "scaffold"
+  ],
+  "inputDefaults": {
+    "projectName": "my-api",
+    "servicePort": "8000"
+  },
+  "steps": [
+    {
+      "tool": "make_dir",
+      "args": {
+        "path": "{{projectName}}/src"
+      }
+    },
+    {
+      "tool": "make_dir",
+      "args": {
+        "path": "{{projectName}}/tests"
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/pyproject.toml",
+        "content": "[project]\nname = \"{{projectName}}\"\nversion = \"0.1.0\"\nrequires-python = \">=3.11\"\ndependencies = [\"fastapi>=0.110\", \"uvicorn[standard]>=0.29\"]\n\n[project.optional-dependencies]\ndev = [\"pytest\", \"httpx\"]\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/src/main.py",
+        "content": "from fastapi import FastAPI\n\napp = FastAPI(title=\"{{projectName}}\")\n\n@app.get(\"/health\")\ndef health():\n    return {\"ok\": True}\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/tests/test_health.py",
+        "content": "from fastapi.testclient import TestClient\nfrom src.main import app\n\nclient = TestClient(app)\n\ndef test_health():\n    r = client.get(\"/health\")\n    assert r.status_code == 200\n    assert r.json()[\"ok\"] is True\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/README.md",
+        "content": "# {{projectName}}\n\nGenerated with LocalClaw `scaffold_python_fastapi`.\n\n```bash\nuv sync && uv run uvicorn src.main:app --reload --port {{servicePort}}\n# tests: uv run pytest\n```\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/.gitignore",
+        "content": "__pycache__\n.venv\n.env\n*.pyc\n.DS_Store\n",
+        "overwrite": true
+      }
+    }
+  ]
+}

@@ -121,9 +121,7 @@ And this is Stallone.
 
 **Stallone** — after Rocky Balboa. Gets knocked down, gets back up. Doesn't quit.
 The project was knocked down by months of failure. It gets back up.
-
-**Arnold** — the agent running inside Stallone. After the Terminator.
-Autonomous. Always learning. Always comes back. Gets the job done.
+The agent, the system, the runtime — all of it is Stallone.
 
 ---
 

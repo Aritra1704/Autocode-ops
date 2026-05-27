@@ -1,0 +1,27 @@
+{
+  "name": "discover_and_register_projects",
+  "version": 1,
+  "description": "Scan the workspace root for git repositories, register each one as a project target, and spawn a context-generation sub-task for each unregistered repo.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["setup", "onboarding", "project", "register", "context"],
+  "inputDefaults": {
+    "workspaceRoot": "."
+  },
+  "steps": [
+    {
+      "tool": "run_terminal_command",
+      "args": {
+        "command": "find {{workspaceRoot}} -maxdepth 2 -name '.git' -type d | sed 's|/.git$||' | sort"
+      }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Register and document all discovered repos",
+        "description": "For each repo: 1. Identify language/framework. 2. Read README.md. 3. Write PROJECT_CONTEXT.md. 4. Call register_project.",
+        "priority": "high"
+      }
+    }
+  ]
+}

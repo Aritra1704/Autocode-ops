@@ -1,0 +1,25 @@
+{
+  "name": "auto_prune",
+  "version": 1,
+  "description": "Automatically cleans up logs and build artifacts to reclaim space.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["maintenance", "system"],
+  "inputDefaults": {},
+  "steps": [
+    {
+      "tool": "system_prune",
+      "args": {
+        "target": "logs",
+        "days": 7
+      }
+    },
+    {
+      "tool": "system_prune",
+      "args": {
+        "target": "build_artifacts",
+        "days": 1
+      }
+    }
+  ]
+}

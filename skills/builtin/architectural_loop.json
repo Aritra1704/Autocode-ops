@@ -1,0 +1,58 @@
+{
+  "name": "architectural_loop",
+  "version": 1,
+  "description": "Orchestrates a multi-phase architectural workflow: generates HLD, decomposes into stages, and iteratively implements each stage via sub-tasks.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["architecture", "hld", "lld", "automation"],
+  "inputDefaults": {
+    "projectTitle": "ContractGenie",
+    "blueprintPath": "ContractGenie/project_plan_v2.md",
+    "stageTrackerPath": "ContractGenie/STAGE_TRACKER.md"
+  },
+  "steps": [
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{stageTrackerPath}}",
+        "content": "# Stage Tracker for ContractGenie\n\n- [ ] Stage 0: Infrastructure & API Specs (Tests: DB Connectivity)\n- [ ] Stage 1: User Service (Tests: JWT Auth)\n- [ ] Stage 2: PDF Service (Tests: PDF Generation)\n- [ ] Stage 3: Contract Service (Tests: Orchestration & Email)\n- [ ] Stage 4: Frontend & Nginx (Tests: E2E Flow)",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Stage 0: Infrastructure & API Specs",
+        "description": "Initialize Docker Compose with PostgreSQL/Nginx and create api-spec.json as defined in the blueprint. Verify with Stage 0 test cases."
+      }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Stage 1: User Service",
+        "description": "Implement User Service in backend/user-service with JWT auth as defined in the blueprint. Verify with Stage 1 test cases."
+      }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Stage 2: PDF Service",
+        "description": "Implement PDF Service in backend/pdf-service for document generation as defined in the blueprint. Verify with Stage 2 test cases."
+      }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Stage 3: Contract Service",
+        "description": "Implement Contract Service in backend/contract-service with SendGrid as defined in the blueprint. Verify with Stage 3 test cases."
+      }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Stage 4: Frontend & Nginx",
+        "description": "Implement React frontend and Nginx routing as defined in the blueprint. Verify with Stage 4 test cases."
+      }
+    }
+  ]
+}

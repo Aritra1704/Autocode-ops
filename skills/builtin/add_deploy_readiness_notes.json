@@ -1,0 +1,21 @@
+{
+  "name": "add_deploy_readiness_notes",
+  "version": 1,
+  "description": "Append a lightweight deploy readiness checklist to README for repeatable release prep.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["deploy", "readme", "checklist"],
+  "inputDefaults": {
+    "checkCommand": "npm test",
+    "deployCommand": "npm start"
+  },
+  "steps": [
+    {
+      "tool": "append_file",
+      "args": {
+        "path": "README.md",
+        "content": "\n## Deploy Readiness Checklist\n\n- Run verification: `{{checkCommand}}`\n- Confirm `.env` values are set for runtime\n- Verify `/healthz` responds locally\n- Trigger deployment after explicit approval\n- Smoke test production route after deploy command: `{{deployCommand}}`\n"
+      }
+    }
+  ]
+}

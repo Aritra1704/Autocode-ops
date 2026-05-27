@@ -1,5 +1,5 @@
 # Stallone Architecture
-## Arnold — The Autonomous Coding Agent
+## Stallone — The Autonomous Coding Agent
 
 *Version 0.1 — Planning Document*
 *Date: May 27, 2026*
@@ -8,7 +8,7 @@
 
 ## Core Philosophy
 
-> "Gemini thinks. Ollama types. Arnold ships."
+> "Gemini thinks. Ollama types. Stallone ships."
 
 Gemini is not just a model in Stallone — it IS the runtime. It drives every decision,
 calls every tool, and never steps away from a task until it's done or has a clear reason
@@ -25,7 +25,7 @@ Task → Planner generates static JSON plan → Executor blindly runs steps in o
        (Gemini plans ONCE and steps away)
 ```
 
-**Arnold architecture:**
+**Stallone architecture:**
 ```
 Task → Gemini enters a tool loop
        Gemini decides next tool → LocalClaw executes → result returned to Gemini
@@ -102,7 +102,7 @@ This is the same pattern Claude Code uses. The model drives. The runtime execute
 
 ### 1. GeminiDriver — `src/brain/geminiDriver.js`
 
-The heart of Arnold. Replaces the Orchestrator + Planner + Executor from LocalClaw.
+The heart of Stallone. Replaces the Orchestrator + Planner + Executor from LocalClaw.
 
 **What it does:**
 - Opens a Gemini multi-turn session (function calling mode)
@@ -214,7 +214,7 @@ Loads the right ~2000 tokens at the start of each Gemini context window:
 - Last 3 relevant learnings for this project/task type (500 tokens)
 - Last context checkpoint if resuming a mid-task window (500 tokens)
 - Recent git log for project (200 tokens)
-- Arnold soul (200 tokens)
+- Stallone soul (200 tokens)
 Total: ~2000 tokens. Gemini requests additional files explicitly via `read_file`.
 
 #### 4b. ContextCompactor — `src/context/compactor.js`
@@ -226,7 +226,7 @@ At 70% of budget:
   - Current file hashes (knows what was changed without re-reading)
   - Key decisions made (architecture choices, model selections)
 At 90%: open new Gemini context window, load from checkpoint via ContextLoader.
-This is also crash recovery — Arnold always resumes from last checkpoint.
+This is also crash recovery — Stallone always resumes from last checkpoint.
 
 ---
 
@@ -267,7 +267,7 @@ Also tracks total spend per project for billing awareness.
 
 ### 6. Soul — `src/memory/soul.md`
 
-Arnold's identity. Evolved from LocalClaw's soul.
+Stallone's identity. Evolved from LocalClaw's soul.
 
 Core directives:
 - Precision first: `patch_file` over `write_file` always
@@ -303,7 +303,7 @@ These modules are copied as-is (minor config updates only):
 | `src/railway/` | Railway deployer (optional feature) |
 | `src/telegram/` | Telegram bot + commands (extended with /online, /offline) |
 | `src/control/api.js` | HTTP control API + React dashboard bridge |
-| `src/cli/` | CLI (renamed: `arnold` command) |
+| `src/cli/` | CLI (renamed: `stallone` command) |
 | `src/mcp/` | MCP servers (postgres, filesystem, github) |
 | `src/llm/providers/` | Gemini + Ollama provider clients |
 | `src/browser/automation.js` | Browser automation for UI testing |
@@ -324,14 +324,14 @@ These modules are copied as-is (minor config updates only):
 | `src/selfhealing/repairEngine.js` | Gemini self-repairs inline |
 | `src/selfimprovement/reflectionEngine.js` | Gemini reflects continuously |
 | `src/persona/artifacts.js` | Simplified to notification formatting only |
-| `src/project/contract.js` (workspace isolation) | Arnold works in real project dirs |
+| `src/project/contract.js` (workspace isolation) | Stallone works in real project dirs |
 | `src/control/taskContract.js` (executionPolicy) | All tasks are auto_local by default |
 
 ---
 
 ## Database — New Tables Needed
 
-On top of LocalClaw's existing 11 migrations, Arnold adds:
+On top of LocalClaw's existing 11 migrations, Stallone adds:
 
 ```sql
 -- Migration 012: model performance tracking
@@ -375,8 +375,8 @@ CREATE TABLE presence_log (
 Inherits all LocalClaw `.env` variables, adds:
 
 ```env
-# Arnold identity
-ARNOLD_NAME=Arnold
+# Stallone identity
+STALLONE_NAME=Stallone
 ORCHESTRATOR_MODE=gemini  # gemini | local (local = Ollama-only fallback)
 
 # Gemini
@@ -392,7 +392,7 @@ OLLAMA_DEFAULT_ROUTER_MODEL=llama3.2:3b
 OLLAMA_DEFAULT_VERIFIER_MODEL=qwen2.5-coder:7b
 
 # Workspace (no more SSD isolation)
-ARNOLD_WORKSPACE_ROOT=/Users/aritrarpal/Documents/workspace_biz
+STALLONE_WORKSPACE_ROOT=/Users/aritrarpal/Documents/workspace_biz
 
 # Presence
 PRESENCE_ONLINE_THRESHOLD=0.5
@@ -410,7 +410,7 @@ SKILLS_AUTO_GENERATE_MIN_PATTERN_COUNT=3
 
 ```
 1. DB connect + run pending migrations
-2. Load soul.md → Arnold's identity
+2. Load soul.md → Stallone's identity
 3. Warm Ollama models (non-blocking)
 4. Start RAG ingestor (background)
 5. Start knowledge graph sync (background)
@@ -426,7 +426,7 @@ SKILLS_AUTO_GENERATE_MIN_PATTERN_COUNT=3
 
 ## The Heartbeat
 
-Arnold proactively scans the workspace every hour (configurable).
+Stallone proactively scans the workspace every hour (configurable).
 Gemini drives this scan — not a static Ollama prompt.
 It looks for: dependency drift, documentation rot, security risks, code quality issues.
 If it finds something: creates a task with `source: 'heartbeat'`, `priority: 'low'`.
@@ -465,5 +465,5 @@ No `waiting_approval`. No `executionPolicy`. No approval gates for local work.
 
 ---
 
-*This document is the living spec for Arnold.*
-*When Arnold modifies his own architecture, he updates this document.*
+*This document is the living spec for Stallone.*
+*When Stallone modifies his own architecture, he updates this document.*

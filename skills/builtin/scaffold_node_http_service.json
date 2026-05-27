@@ -1,0 +1,45 @@
+{
+  "name": "scaffold_node_http_service",
+  "version": 1,
+  "description": "Create a minimal Node.js HTTP service scaffold with package metadata and health endpoint.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["node", "service", "scaffold", "http"],
+  "inputDefaults": {
+    "projectName": "localclaw-service",
+    "servicePort": "3000",
+    "serviceRoot": "localclaw-service"
+  },
+  "steps": [
+    {
+      "tool": "make_dir",
+      "args": {
+        "path": "{{serviceRoot}}/src"
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{serviceRoot}}/package.json",
+        "content": "{\n  \"name\": \"{{projectName}}\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": {\n    \"start\": \"node src/app.js\"\n  }\n}\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{serviceRoot}}/src/app.js",
+        "content": "import http from 'node:http';\n\nconst port = Number(process.env.PORT || '{{servicePort}}');\n\nconst server = http.createServer((req, res) => {\n  if (req.url === '/healthz') {\n    res.writeHead(200, { 'content-type': 'application/json' });\n    res.end(JSON.stringify({ ok: true }));\n    return;\n  }\n\n  res.writeHead(200, { 'content-type': 'text/plain' });\n  res.end('localclaw service is running');\n});\n\nserver.listen(port, () => {\n  console.log(`service listening on ${port}`);\n});\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{serviceRoot}}/README.md",
+        "content": "# {{projectName}}\n\nGenerated with LocalClaw built-in skill `scaffold_node_http_service`.\n\n## Run\n\n```bash\ncd {{serviceRoot}}\nnpm start\n```\n\n## Health check\n\n```bash\ncurl http://localhost:{{servicePort}}/healthz\n```\n",
+        "overwrite": true
+      }
+    }
+  ]
+}

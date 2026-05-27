@@ -1,0 +1,26 @@
+{
+  "name": "create_scaffold_skill",
+  "version": 1,
+  "description": "Interactively collect project-type requirements and write a new scaffold skill JSON to skills/builtin/. LocalClaw asks clarifying questions then generates the full skill.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["meta", "skills", "scaffold", "generator"],
+  "inputDefaults": {
+    "skillName": "",
+    "description": "",
+    "stack": "",
+    "startCommand": "",
+    "testCommand": "",
+    "entryFile": ""
+  },
+  "steps": [
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Generate scaffold skill: {{skillName}}",
+        "description": "Create a new LocalClaw scaffold skill JSON file at skills/builtin/{{skillName}}.json. Inputs collected: Skill name, Stack, Start command, Test command, Entry file, Description. Instructions: 1. Determine required project files. 2. Write file contents as args. 3. Use template variables. 4. Write skill to skills/builtin/. 5. Verify JSON validity.",
+        "priority": "high"
+      }
+    }
+  ]
+}

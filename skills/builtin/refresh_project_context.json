@@ -1,0 +1,33 @@
+{
+  "name": "refresh_project_context",
+  "version": 1,
+  "description": "Re-read a repo's stack files and rewrite its PROJECT_CONTEXT.md using the current code state.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": ["context", "documentation", "project"],
+  "inputDefaults": {
+    "projectPath": "."
+  },
+  "steps": [
+    {
+      "tool": "list_files",
+      "args": { "path": "{{projectPath}}", "recursive": false, "limit": 40 }
+    },
+    {
+      "tool": "read_file",
+      "args": { "path": "{{projectPath}}/package.json", "maxChars": 2000 }
+    },
+    {
+      "tool": "read_file",
+      "args": { "path": "{{projectPath}}/README.md", "maxChars": 4000 }
+    },
+    {
+      "tool": "spawn_subtask",
+      "args": {
+        "title": "Rewrite PROJECT_CONTEXT.md for {{projectPath}}",
+        "description": "Using the file list and stack files just read, write a fresh PROJECT_CONTEXT.md to {{projectPath}}/PROJECT_CONTEXT.md. Follow the standard template: Stack, Entry Point, Test Command, Key Directories, Constraints. Use Gemini to fill each section accurately from the actual file content.",
+        "projectPath": "{{projectPath}}"
+      }
+    }
+  ]
+}

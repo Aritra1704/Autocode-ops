@@ -1,0 +1,35 @@
+{
+  "name": "stallone",
+  "version": "0.1.0",
+  "description": "Autonomous 24/7 coding agent. Gemini drives the tool loop. Ollama generates code. Git verifies every step.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "migrate": "node src/db/migrate.js",
+    "cli": "node src/cli/bin.js",
+    "ui:dev": "npm --prefix web run dev",
+    "ui:build": "npm --prefix web run build"
+  },
+  "bin": {
+    "stallone": "src/cli/bin.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "private": "true",
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "dotenv": "^17.4.1",
+    "pg": "^8.20.0",
+    "playwright": "^1.54.0",
+    "pino": "^10.3.1",
+    "telegraf": "^4.16.3",
+    "zod": "^4.3.6"
+  }
+}

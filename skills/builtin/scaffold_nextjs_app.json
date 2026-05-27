@@ -1,0 +1,79 @@
+{
+  "name": "scaffold_nextjs_app",
+  "version": 1,
+  "description": "Scaffold a Next.js 14 App Router project with TypeScript, Tailwind, and a health API route.",
+  "sourceType": "builtin",
+  "isEnabled": true,
+  "tags": [
+    "next",
+    "react",
+    "typescript",
+    "scaffold"
+  ],
+  "inputDefaults": {
+    "projectName": "my-next-app",
+    "servicePort": "3000"
+  },
+  "steps": [
+    {
+      "tool": "make_dir",
+      "args": {
+        "path": "{{projectName}}/app"
+      }
+    },
+    {
+      "tool": "make_dir",
+      "args": {
+        "path": "{{projectName}}/app/api/health"
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/package.json",
+        "content": "{\n  \"name\": \"{{projectName}}\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"dev\": \"next dev\",\n    \"build\": \"next build\",\n    \"start\": \"next start\",\n    \"lint\": \"next lint\"\n  },\n  \"dependencies\": {\n    \"next\": \"14.2.0\",\n    \"react\": \"^18\",\n    \"react-dom\": \"^18\"\n  },\n  \"devDependencies\": {\n    \"typescript\": \"^5\",\n    \"@types/node\": \"^20\",\n    \"@types/react\": \"^18\",\n    \"tailwindcss\": \"^3\",\n    \"autoprefixer\": \"^10\",\n    \"postcss\": \"^8\"\n  }\n}\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/app/page.tsx",
+        "content": "export default function Home() {\n  return <main className=\"p-8\"><h1 className=\"text-2xl font-bold\">{{projectName}}</h1></main>;\n}\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/app/api/health/route.ts",
+        "content": "import { NextResponse } from \"next/server\";\nexport function GET() {\n  return NextResponse.json({ ok: true });\n}\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/next.config.js",
+        "content": "/** @type {import(\"next\").NextConfig} */\nconst nextConfig = {};\nmodule.exports = nextConfig;\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/.gitignore",
+        "content": ".next\nnode_modules\n.env.local\n.DS_Store\n",
+        "overwrite": true
+      }
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "{{projectName}}/README.md",
+        "content": "# {{projectName}}\n\nGenerated with LocalClaw `scaffold_nextjs_app`.\n\n```bash\nnpm install && npm run dev\n# open http://localhost:{{servicePort}}\n```\n",
+        "overwrite": true
+      }
+    }
+  ]
+}
