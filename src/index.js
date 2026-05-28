@@ -10,6 +10,7 @@ import * as migrateModule from './db/migrate.js';
 import { createRagIngestor } from './rag/ingestor.js';
 import { createGeminiDriver } from './brain/geminiDriver.js';
 import { loadTaskContext } from './context/loader.js';
+import { buildTaskTitleFromContract, buildTaskDescriptionFromContract } from './control/taskContract.js';
 
 const logger = pino({ name: 'stallone' });
 
@@ -143,6 +144,18 @@ function createControlOrchestrator(activeTaskIds, pool) {
     },
     async listSkills() {
       return [];
+    },
+    async createPlannedTask(contract, options) {
+      const title = buildTaskTitleFromContract(contract);
+      const description = buildTaskDescriptionFromContract(contract);
+      const result = await pool.query(
+        `INSERT INTO tasks (title, description, priority, source, project_name, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')
+         RETURNING *`,
+        [title, description, contract.priority ?? 'medium', options?.source ?? 'manual', contract.projectName]
+      );
+      const task = result.rows[0];
+      return { task, execution: null, executionApproval: null };
     },
   };
 

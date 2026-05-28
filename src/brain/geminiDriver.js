@@ -1,3 +1,7 @@
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { promisify } from 'node:util';
+
 import { config } from '../config.js';
 import { createGeminiClient } from '../llm/providers/gemini.js';
 import { runOllamaSubAgent } from './ollamaSubAgent.js';
@@ -6,7 +10,43 @@ import { computePresenceScore, isHumanOnline } from '../intelligence/onlineDetec
 import { createTokenBudget } from '../intelligence/tokenBudget.js';
 import { createContextCompactor } from '../context/compactor.js';
 
+const execFileAsync = promisify(execFile);
+
 const MAX_STEPS = 30;
+
+// Calls Ollama /api/chat with a full message history and returns the response text.
+async function ollamaChat({ model, system, messages, timeoutMs = 300_000 }) {
+  const baseUrl = config.ollamaBaseUrl.replace(/\/$/, '');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const payload = [{ role: 'system', content: system }, ...messages];
+
+  try {
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        messages: payload,
+        stream: false,
+        format: 'json',
+        options: { temperature: 0.1 },
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Ollama /api/chat failed (${response.status}): ${text.slice(0, 200)}`);
+    }
+
+    const data = await response.json();
+    return data?.message?.content ?? '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export function createGeminiDriver(pool, options = {}) {
   const gemini = options.geminiClient ?? createGeminiClient();
@@ -30,8 +70,12 @@ export function createGeminiDriver(pool, options = {}) {
         'You are Stallone, an autonomous coding agent.',
         'You work by calling tools in sequence until the task is complete.',
         'Available tools (call as JSON in your response):',
-        '  { "tool": "run_ollama", "filePath": "...", "instruction": "...", "context": "..." }',
+        '  { "tool": "run_ollama", "filePath": "relative/path/to/file.ext", "instruction": "...", "context": "..." }',
+        '    filePath must be a path RELATIVE to the workspace root (e.g. "hello.txt", "src/index.js"). Never use an absolute path or a directory.',
         '    → delegates code generation to a local Ollama model',
+        '  { "tool": "run_shell", "command": "...", "cwd": "relative/path" }',
+        '    cwd is optional, relative to workspace root. command runs in a shell with a 60s timeout.',
+        '    → runs a shell command to verify files exist, compile code, or run tests',
         '  { "tool": "ask_human", "question": "...", "context": "..." }',
         '    → parks the task and waits for the human to push a commit',
         '  { "tool": "done", "summary": "..." }',
@@ -43,8 +87,11 @@ export function createGeminiDriver(pool, options = {}) {
         '- Call one tool per response.',
         '- After each tool result, decide the next tool.',
         '- Use run_ollama for all file edits and code generation.',
-        '- Use ask_human only when you are genuinely stuck.',
-        '- Call done when all steps in the task are complete.',
+        '- If run_ollama fails, retry immediately with a clearer or simpler instruction. Do NOT skip a file and call done.',
+        '- Only call done when EVERY file required by the task has been successfully written (run_ollama returned success for each one). Verify this before calling done.',
+        '- After writing all files, use run_shell to verify they exist and that the code compiles. Fix any errors before calling done.',
+        '- If run_ollama fails 3 consecutive times for the same file, call fail explaining which file could not be written.',
+        '- Use ask_human only when you are genuinely stuck and retrying will not help.',
         '- Never output plain text — always output a JSON tool call.',
       ].join('\n');
 
@@ -73,25 +120,46 @@ export function createGeminiDriver(pool, options = {}) {
           // Continue — compaction is logged, loop goes on
         }
 
-        // Call Gemini
+        // Call the orchestrator LLM (Ollama locally, or Gemini if API key is set)
         let responseText;
         try {
-          const geminiResponse = await gemini.generate({
-            model: config.geminiDefaultModel,
-            system: systemPrompt,
-            prompt: messages[messages.length - 1].content,
-            format: 'json',
-            retries: 1,
-          });
-          responseText = geminiResponse.responseText;
-
-          // Track tokens
-          const tokensUsed =
-            (geminiResponse.promptEvalCount ?? 0) + (geminiResponse.evalCount ?? 0);
-          if (tokensUsed > 0) budget.add(tokensUsed);
-        } catch (error) {
-          lastError = error?.message ?? 'Gemini call failed';
-          break;
+          if (config.geminiEnabled) {
+            const geminiResponse = await gemini.generate({
+              model: config.geminiDefaultModel,
+              system: systemPrompt,
+              prompt: messages.map((m) => `${m.role}: ${m.content}`).join('\n\n'),
+              format: 'json',
+              retries: 1,
+            });
+            responseText = geminiResponse.responseText;
+            const tokensUsed =
+              (geminiResponse.promptEvalCount ?? 0) + (geminiResponse.evalCount ?? 0);
+            if (tokensUsed > 0) budget.add(tokensUsed);
+          } else {
+            // Local-only: use Ollama /api/chat with full conversation history
+            responseText = await ollamaChat({
+              model: config.ollamaModelOrchestrator,
+              system: systemPrompt,
+              messages,
+            });
+          }
+        } catch (geminiError) {
+          if (config.geminiEnabled) {
+            // Gemini failed (rate limit, network, high demand) — fall back to local Ollama for this step
+            try {
+              responseText = await ollamaChat({
+                model: config.ollamaModelOrchestrator,
+                system: systemPrompt,
+                messages,
+              });
+            } catch (ollamaError) {
+              lastError = `Gemini failed: ${geminiError?.message}. Ollama fallback also failed: ${ollamaError?.message}`;
+              break;
+            }
+          } else {
+            lastError = geminiError?.message ?? 'Orchestrator LLM call failed';
+            break;
+          }
         }
 
         // Parse the tool call from Gemini's response
@@ -134,6 +202,29 @@ export function createGeminiDriver(pool, options = {}) {
             : `run_ollama failed after ${result.attempts} attempts: ${result.error}`;
 
           steps.push({ step: stepNumber, tool: 'run_ollama', success: result.success, summary: toolResultMessage });
+          messages.push({ role: 'assistant', content: responseText });
+          messages.push({ role: 'user', content: toolResultMessage });
+          continue;
+        }
+
+        // --- Tool: run_shell ---
+        if (toolName === 'run_shell') {
+          const shellCwd = path.resolve(task.project_path ?? workspaceRoot, toolCall.cwd ?? '.');
+          let toolResultMessage;
+          try {
+            const { stdout, stderr } = await execFileAsync('sh', ['-c', toolCall.command ?? 'true'], {
+              cwd: shellCwd,
+              timeout: 60_000,
+              maxBuffer: 100_000,
+            });
+            const output = [stdout, stderr].filter(Boolean).join('\n').slice(0, 3000);
+            toolResultMessage = `run_shell succeeded.\n${output || '(no output)'}`;
+            steps.push({ step: stepNumber, tool: 'run_shell', success: true });
+          } catch (error) {
+            const output = [error.stdout, error.stderr].filter(Boolean).join('\n').slice(0, 3000);
+            toolResultMessage = `run_shell failed (exit ${error.code ?? 'unknown'}).\n${output || error.message}`;
+            steps.push({ step: stepNumber, tool: 'run_shell', success: false });
+          }
           messages.push({ role: 'assistant', content: responseText });
           messages.push({ role: 'user', content: toolResultMessage });
           continue;
