@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
@@ -9,8 +10,13 @@ import { getPool, checkDatabaseConnection, closePool } from './db/client.js';
 import * as migrateModule from './db/migrate.js';
 import { createRagIngestor } from './rag/ingestor.js';
 import { createGeminiDriver } from './brain/geminiDriver.js';
+import { createGeminiClient } from './llm/providers/gemini.js';
+import { createOllamaClient } from './llm/ollama.js';
 import { loadTaskContext } from './context/loader.js';
 import { buildTaskTitleFromContract, buildTaskDescriptionFromContract } from './control/taskContract.js';
+import { startGeminiReviewLoop } from './intelligence/geminiReviewLoop.js';
+import { createLearningExtractor } from './learnings/extractor.js';
+import { createSkillGenerator } from './intelligence/skillGenerator.js';
 
 const logger = pino({ name: 'stallone' });
 
@@ -148,11 +154,14 @@ function createControlOrchestrator(activeTaskIds, pool) {
     async createPlannedTask(contract, options) {
       const title = buildTaskTitleFromContract(contract);
       const description = buildTaskDescriptionFromContract(contract);
+      const projectPath = contract.projectName
+        ? path.join(config.stalloneWorkspaceRoot, contract.projectName)
+        : null;
       const result = await pool.query(
-        `INSERT INTO tasks (title, description, priority, source, project_name, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending')
+        `INSERT INTO tasks (title, description, priority, source, project_name, project_path, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')
          RETURNING *`,
-        [title, description, contract.priority ?? 'medium', options?.source ?? 'manual', contract.projectName]
+        [title, description, contract.priority ?? 'medium', options?.source ?? 'manual', contract.projectName, projectPath]
       );
       const task = result.rows[0];
       return { task, execution: null, executionApproval: null };
@@ -262,6 +271,19 @@ async function bootstrap() {
 
   const workspaceRoot = config.stalloneWorkspaceRoot ?? process.cwd();
   const activeTaskIds = new Set();
+  const geminiClient = createGeminiClient();
+  const ollamaClient = createOllamaClient();
+  // Minimal model selector for the learning extractor — uses the existing coder model
+  // (avoids pulling in the full createModelSelector which expects different config field names)
+  const learningModelSelector = { select: () => `ollama::${config.ollamaModelCoder}` };
+  const learningExtractor = createLearningExtractor({
+    client: ollamaClient,
+    modelSelector: learningModelSelector,
+    pool,
+  });
+  const skillGenerator = createSkillGenerator(pool, {
+    skillsDir: path.join(process.cwd(), 'skills', 'generated'),
+  });
 
   await loadSoulIfPresent(pool, workspaceRoot);
 
@@ -272,10 +294,16 @@ async function bootstrap() {
     return ingestor;
   });
 
-  await createSkillManagerIfPresent(pool, workspaceRoot);
+  const skillManager = await createSkillManagerIfPresent(pool, workspaceRoot);
 
   const geminiDriver = await startSubsystem('gemini_driver', async () =>
-    createGeminiDriver(pool, { workspaceRoot })
+    createGeminiDriver(pool, {
+      workspaceRoot,
+      geminiClient,
+      learningExtractor,
+      skillGenerator,
+      skillManager,
+    })
   );
 
   let telegramBot = null;
@@ -320,6 +348,8 @@ async function bootstrap() {
       return api;
     });
   }
+
+  startGeminiReviewLoop(pool, geminiClient, logger);
 
   async function runTask(task) {
     try {

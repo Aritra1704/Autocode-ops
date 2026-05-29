@@ -9,6 +9,7 @@ import { delegateToHuman } from '../agents/humanDelegationAgent.js';
 import { computePresenceScore, isHumanOnline } from '../intelligence/onlineDetector.js';
 import { createTokenBudget } from '../intelligence/tokenBudget.js';
 import { createContextCompactor } from '../context/compactor.js';
+import { checkAndEvictIfNeeded } from '../intelligence/modelResourceGuard.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +24,8 @@ async function ollamaChat({ model, system, messages, timeoutMs = 300_000 }) {
   const payload = [{ role: 'system', content: system }, ...messages];
 
   try {
+    await checkAndEvictIfNeeded();
+
     const response = await fetch(`${baseUrl}/api/chat`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -49,8 +52,14 @@ async function ollamaChat({ model, system, messages, timeoutMs = 300_000 }) {
 }
 
 export function createGeminiDriver(pool, options = {}) {
-  const gemini = options.geminiClient ?? createGeminiClient();
-  const workspaceRoot = options.workspaceRoot ?? config.stalloneWorkspaceRoot ?? process.cwd();
+  const {
+    workspaceRoot = config.stalloneWorkspaceRoot ?? process.cwd(),
+    geminiClient = createGeminiClient(),
+    learningExtractor = null,
+    skillGenerator = null,
+    skillManager = null,
+  } = options;
+  const gemini = geminiClient;
 
   return {
     async runTask(task, context) {
@@ -64,6 +73,8 @@ export function createGeminiDriver(pool, options = {}) {
       const steps = [];
       let stepNumber = 0;
       let lastError = null;
+      let usedOllamaFallback = false;
+      let taskSucceeded = false;
 
       // Build the system prompt
       const systemPrompt = [
@@ -147,6 +158,7 @@ export function createGeminiDriver(pool, options = {}) {
           if (config.geminiEnabled) {
             // Gemini failed (rate limit, network, high demand) — fall back to local Ollama for this step
             try {
+              usedOllamaFallback = true;
               responseText = await ollamaChat({
                 model: config.ollamaModelOrchestrator,
                 system: systemPrompt,
@@ -177,7 +189,8 @@ export function createGeminiDriver(pool, options = {}) {
         // --- Tool: done ---
         if (toolName === 'done') {
           steps.push({ step: stepNumber, tool: 'done', summary: toolCall.summary });
-          return { success: true, stepsCompleted: stepNumber, error: null };
+          taskSucceeded = true;
+          break;
         }
 
         // --- Tool: fail ---
@@ -270,11 +283,59 @@ export function createGeminiDriver(pool, options = {}) {
         lastError = `Reached maximum steps (${MAX_STEPS}) without completing the task`;
       }
 
-      return {
-        success: false,
-        stepsCompleted: stepNumber,
-        error: lastError ?? 'unknown error',
-      };
+      await pool.query(
+        `UPDATE tasks
+         SET orchestrator_model = $1,
+             gemini_review_status = $2
+         WHERE id = $3`,
+        [
+          usedOllamaFallback ? config.ollamaModelOrchestrator : config.geminiDefaultModel,
+          usedOllamaFallback ? 'pending' : null,
+          task.id,
+        ]
+      );
+
+      const driverResult = taskSucceeded
+        ? { success: true, stepsCompleted: stepNumber, error: null }
+        : {
+            success: false,
+            stepsCompleted: stepNumber,
+            error: lastError ?? 'unknown error',
+          };
+
+      if (learningExtractor) {
+        try {
+          const learnings = await learningExtractor.extract(task, {
+            success: driverResult.success,
+            stepsCompleted: driverResult.stepsCompleted,
+            error: driverResult.error,
+            steps,
+          });
+
+          if (learnings.length > 0 && skillGenerator) {
+            const topCategory = [...learnings].sort(
+              (left, right) => right.confidenceScore - left.confidenceScore
+            )[0]?.category;
+
+            if (topCategory) {
+              // Always query DB (which already has current task's learnings persisted) so the
+              // cluster includes historical learnings across all tasks, not just this one.
+              const generationResult = await skillGenerator.checkAndGenerate(topCategory);
+
+              if (generationResult.generated && skillManager) {
+                await skillManager.syncToDatabase();
+              }
+            }
+          }
+        } catch (hookError) {
+          console.warn(
+            '[geminiDriver] post-task hook failed (non-fatal):',
+            hookError?.message ?? hookError
+          );
+        }
+      }
+
+      return driverResult;
     },
   };
 }

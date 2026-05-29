@@ -10,8 +10,83 @@ function sanitizeName(value) {
     .slice(0, 80);
 }
 
-function patternKey(observation) {
-  return String(observation ?? '').trim().slice(0, 80);
+function scrubSensitive(text) {
+  // TODO(privacy): implement scrubSensitive — see docs/PRIVACY_AND_SECRETS.md
+  return text;
+}
+
+function extractKeywords(text) {
+  return new Set(
+    String(text ?? '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((word) => word.length >= 4)
+  );
+}
+
+function similarityScore(observationA, observationB) {
+  const keywordsA = extractKeywords(observationA);
+  const keywordsB = extractKeywords(observationB);
+
+  if (keywordsA.size === 0 || keywordsB.size === 0) {
+    return 0;
+  }
+
+  const intersection = [...keywordsA].filter((word) => keywordsB.has(word)).length;
+  return intersection / Math.max(keywordsA.size, keywordsB.size);
+}
+
+function normalizeLearningRow(row) {
+  return {
+    category: row.category ?? 'execution',
+    observation: String(row.observation ?? '').trim(),
+    confidenceScore: Number.isFinite(row.confidenceScore)
+      ? row.confidenceScore
+      : Number.isFinite(row.confidence_score)
+        ? row.confidence_score
+        : 0,
+  };
+}
+
+function clusterLearnings(rows) {
+  const clusters = [];
+
+  for (const row of rows) {
+    if (!row.observation) {
+      continue;
+    }
+
+    let bestCluster = null;
+    let bestScore = 0;
+
+    for (const cluster of clusters) {
+      const clusterScore = Math.max(
+        ...cluster.members.map((member) => similarityScore(member.observation, row.observation))
+      );
+      if (clusterScore >= 0.6 && clusterScore > bestScore) {
+        bestCluster = cluster;
+        bestScore = clusterScore;
+      }
+    }
+
+    if (!bestCluster) {
+      clusters.push({
+        members: [row],
+        topObservation: row.observation,
+        topConfidenceScore: row.confidenceScore,
+      });
+      continue;
+    }
+
+    bestCluster.members.push(row);
+    if (row.confidenceScore > bestCluster.topConfidenceScore) {
+      bestCluster.topConfidenceScore = row.confidenceScore;
+      bestCluster.topObservation = row.observation;
+    }
+  }
+
+  return clusters;
 }
 
 async function fileExists(targetPath) {
@@ -27,48 +102,46 @@ export function createSkillGenerator(pool, options = {}) {
   const skillsDir = options.skillsDir ?? path.join(process.cwd(), 'skills', 'generated');
 
   return {
-    async checkAndGenerate(taskCategory) {
-      const result = await pool.query(
-        `SELECT observation, times_applied, created_at
-           FROM learnings
-          WHERE category = $1
-            AND confidence_score >= 7
-          ORDER BY times_applied DESC, created_at DESC
-          LIMIT 20`,
-        [taskCategory]
-      );
-
-      const rows = result.rows;
-      const groups = new Map();
-
-      for (let index = 0; index < rows.length; index += 1) {
-        const row = rows[index];
-        const key = patternKey(row.observation);
-        if (!key) {
-          continue;
-        }
-
-        const current = groups.get(key) ?? {
-          count: 0,
-          topObservation: row.observation,
-          hasConsecutiveSuccesses: false,
-        };
-
-        current.count += 1;
-        if (index > 0 && patternKey(rows[index - 1]?.observation) === key) {
-          current.hasConsecutiveSuccesses = true;
-        }
-
-        groups.set(key, current);
+    async checkAndGenerate(taskCategory, freshLearnings = null) {
+      const skillName = sanitizeName(taskCategory);
+      if (!skillName) {
+        return { generated: false, skillName: null };
       }
 
-      const qualifyingPattern = [...groups.values()]
-        .filter((group) => group.count >= 3 && group.hasConsecutiveSuccesses)
-        .sort((left, right) => right.count - left.count)[0];
+      const rows = Array.isArray(freshLearnings)
+        ? freshLearnings
+            .map(normalizeLearningRow)
+            .filter(
+              (row) => row.category === taskCategory && row.confidenceScore >= 5 && row.observation
+            )
+        : (
+            await pool.query(
+              `SELECT
+                 category,
+                 observation,
+                 confidence_score AS "confidenceScore",
+                 created_at
+               FROM learnings
+              WHERE category = $1
+                AND confidence_score >= 5
+              ORDER BY times_applied DESC, created_at DESC
+              LIMIT 20`,
+              [taskCategory]
+            )
+          ).rows.map(normalizeLearningRow);
 
-      const skillName = sanitizeName(taskCategory);
-      if (!qualifyingPattern || !skillName) {
-        return { generated: false, skillName: null };
+      const qualifyingCluster = clusterLearnings(rows)
+        .filter((cluster) => cluster.members.length >= 3)
+        .sort((left, right) => {
+          // Prefer highest top confidence score first, then largest cluster
+          if (right.topConfidenceScore !== left.topConfidenceScore) {
+            return right.topConfidenceScore - left.topConfidenceScore;
+          }
+          return right.members.length - left.members.length;
+        })[0];
+
+      if (!qualifyingCluster) {
+        return { generated: false, skillName };
       }
 
       const skillPath = path.join(skillsDir, `${skillName}.json`);
@@ -78,7 +151,7 @@ export function createSkillGenerator(pool, options = {}) {
 
       const definition = {
         name: skillName,
-        description: qualifyingPattern.topObservation,
+        description: scrubSensitive(qualifyingCluster.topObservation),
         version: 1,
         source_type: 'generated',
         steps: [],
@@ -104,6 +177,10 @@ export function createSkillGenerator(pool, options = {}) {
         const filePath = path.join(skillsDir, entry.name);
         const fileContents = await fs.readFile(filePath, 'utf8');
         const definition = JSON.parse(fileContents);
+        const definitionForDb = {
+          ...definition,
+          description: scrubSensitive(definition.description ?? ''),
+        };
 
         await pool.query(
           `INSERT INTO skills (
@@ -112,22 +189,24 @@ export function createSkillGenerator(pool, options = {}) {
              source_type,
              description,
              definition,
+             is_enabled,
              updated_at
            )
-           VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+           VALUES ($1, $2, $3, $4, $5::jsonb, true, NOW())
            ON CONFLICT (name)
            DO UPDATE
            SET definition = EXCLUDED.definition,
                version = EXCLUDED.version,
                source_type = EXCLUDED.source_type,
                description = EXCLUDED.description,
+               is_enabled = EXCLUDED.is_enabled,
                updated_at = NOW()`,
           [
-            definition.name,
-            definition.version ?? 1,
-            definition.source_type ?? 'generated',
-            definition.description ?? '',
-            JSON.stringify(definition),
+            definitionForDb.name,
+            definitionForDb.version ?? 1,
+            definitionForDb.source_type ?? 'generated',
+            definitionForDb.description,
+            JSON.stringify(definitionForDb),
           ]
         );
 

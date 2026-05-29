@@ -1,15 +1,33 @@
+import { parseModelRef } from '../llm/base.js';
+
 function extractJsonArrayText(value) {
   const trimmed = value.trim();
 
+  // Already an array
   if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
     return trimmed;
   }
 
+  // Model returned a single object — wrap it in an array
+  if (trimmed.startsWith('{')) {
+    const objStart = 0;
+    let depth = 0;
+    let objEnd = -1;
+    for (let i = 0; i < trimmed.length; i++) {
+      if (trimmed[i] === '{') depth++;
+      else if (trimmed[i] === '}') { depth--; if (depth === 0) { objEnd = i; break; } }
+    }
+    if (objEnd !== -1) {
+      return `[${trimmed.slice(objStart, objEnd + 1)}]`;
+    }
+  }
+
+  // Try to find an array somewhere in the text
   const start = trimmed.indexOf('[');
   const end = trimmed.lastIndexOf(']');
 
   if (start === -1 || end === -1 || end <= start) {
-    throw new Error('No JSON array found in learning extractor response');
+    throw new Error('No JSON array or object found in learning extractor response');
   }
 
   return trimmed.slice(start, end + 1);
@@ -27,8 +45,36 @@ function normalizeKeywords(values) {
   )].slice(0, 8);
 }
 
+function scrubSensitive(text) {
+  // TODO(privacy): implement scrubSensitive — see docs/PRIVACY_AND_SECRETS.md
+  return text;
+}
+
+function buildStepSummary(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return 'none';
+  }
+
+  return steps
+    .map((step) => {
+      const detail = String(step.reason ?? step.summary ?? 'completed')
+        .replace(/\s+/g, ' ')
+        .slice(0, 220);
+      const outcome =
+        step.success === false
+          ? `failed: ${detail || 'unknown'}`
+          : step.success === true
+            ? `succeeded: ${detail || 'ok'}`
+            : detail || 'completed';
+      return `- step ${step.step}: ${step.tool} — ${outcome}`;
+    })
+    .join('\n');
+}
+
 function buildPrompt(task, result) {
-  const repairState = result.repairState ?? {};
+  const toolsUsed = [...new Set(result.steps?.map((step) => step.tool) ?? [])];
+  const failedSteps = result.steps?.filter((step) => step.success === false) ?? [];
+
   return `You are extracting reusable engineering learnings from a Stallone task.
 Return only a JSON array and nothing else.
 
@@ -38,24 +84,20 @@ ${task.title}
 Task description:
 ${task.description}
 
-Plan summary:
-${result.plan?.summary ?? 'n/a'}
+Steps completed:
+${result.stepsCompleted ?? 0}
 
-Verification:
-status=${result.verification?.review?.status ?? 'unknown'}
-summary=${result.verification?.review?.summary ?? 'n/a'}
+Outcome:
+${result.success ? 'success' : `failed — ${result.error ?? 'unknown'}`}
 
-Publication:
-attempted=${result.publication?.attempted === true ? 'yes' : 'no'}
-published=${result.publication?.published === true ? 'yes' : 'no'}
-error=${result.publication?.error?.message ?? 'none'}
+Tools used:
+${toolsUsed.join(', ') || 'none'}
 
-Repair:
-status=${repairState.status ?? 'none'}
-attemptCount=${repairState.attemptCount ?? 0}
-maxAttempts=${repairState.maxAttempts ?? 0}
-lastOutcome=${repairState.lastOutcome ?? 'none'}
-lastFailureMessage=${repairState.lastFailureMessage ?? 'none'}
+Failed steps:
+${failedSteps.map((step) => step.tool).join(', ') || 'none'}
+
+Step log:
+${buildStepSummary(result.steps)}
 
 Return 1-4 items.
 JSON schema for each item:
@@ -92,50 +134,73 @@ function parseModelOutput(text) {
 }
 
 function buildFallback(task, result) {
-  const verificationStatus = result.verification?.review?.status ?? 'unknown';
-  const publishError = result.publication?.error?.message ?? null;
-  const repairState = result.repairState ?? {};
   const items = [];
+  const toolsUsed = [...new Set(result.steps?.map((step) => step.tool) ?? [])];
+  const failedSteps = result.steps?.filter((step) => step.success === false) ?? [];
 
   items.push({
-    category: 'verification',
-    observation: `Verification ended with status "${verificationStatus}" for task "${task.title}".`,
-    keywords: ['verification', verificationStatus, 'phase5'],
-    confidenceScore: 6,
+    category: result.success ? 'execution' : 'verification',
+    observation: result.success
+      ? `Task "${task.title}" completed successfully after ${result.stepsCompleted ?? 0} step(s) using ${toolsUsed.join(', ') || 'no recorded tools'}.`
+      : `Task "${task.title}" failed after ${result.stepsCompleted ?? 0} step(s) with error: ${result.error ?? 'unknown error'}.`,
+    keywords: result.success ? ['execution', 'success'] : ['verification', 'failure'],
+    confidenceScore: result.success ? 6 : 7,
   });
 
-  if (publishError) {
+  if (toolsUsed.length > 0) {
     items.push({
-      category: 'publishing',
-      observation: `Publishing surfaced an error: ${publishError.slice(0, 220)}.`,
-      keywords: ['publishing', 'github', 'error'],
-      confidenceScore: 7,
+      category: 'execution',
+      observation: `Task "${task.title}" relied on these tools: ${toolsUsed.join(', ')}.`,
+      keywords: [...toolsUsed, 'tooling'],
+      confidenceScore: 6,
     });
   }
 
-  if (repairState.status === 'resolved' && repairState.attemptCount > 0) {
+  if (failedSteps.length > 0) {
     items.push({
-      category: 'self-healing',
-      observation: `A bounded repair workflow recovered task "${task.title}" after ${repairState.attemptCount} attempt(s).`,
-      keywords: ['self-healing', 'repair', 'retry', 'recovery'],
-      confidenceScore: 8,
-    });
-  } else if (repairState.status === 'exhausted') {
-    items.push({
-      category: 'self-healing',
-      observation: `Repair retries for task "${task.title}" were exhausted after ${repairState.exhaustedAfterAttempt ?? repairState.attemptCount ?? 0} attempt(s), so the run escalated instead of retrying indefinitely.`,
-      keywords: ['self-healing', 'repair', 'budget', 'escalation'],
-      confidenceScore: 9,
+      category: 'verification',
+      observation: `Failures during task "${task.title}" involved: ${failedSteps.map((step) => step.tool).join(', ')}.`,
+      keywords: failedSteps.map((step) => step.tool),
+      confidenceScore: 7,
     });
   }
 
   return items.slice(0, 4);
 }
 
-export function createLearningExtractor({ client, modelSelector }) {
+function sanitizeLearning(item) {
+  return {
+    ...item,
+    observation: scrubSensitive(item.observation),
+    keywords: item.keywords.map((keyword) => scrubSensitive(keyword)),
+  };
+}
+
+async function persistLearnings(pool, taskId, items) {
+  if (!pool || items.length === 0) {
+    return;
+  }
+
+  for (const item of items) {
+    await pool.query(
+      `INSERT INTO learnings (
+         task_id,
+         category,
+         observation,
+         keywords,
+         confidence_score
+       )
+       VALUES ($1, $2, $3, $4::text[], $5)`,
+      [taskId ?? null, item.category, item.observation, item.keywords, item.confidenceScore]
+    );
+  }
+}
+
+export function createLearningExtractor({ client, modelSelector, pool = null }) {
   return {
     async extract(task, result) {
-      const model = modelSelector.select('fast');
+      const model = parseModelRef(modelSelector.select('fast')).model;
+      let learnings = [];
 
       try {
         const response = await client.generate({
@@ -149,13 +214,19 @@ export function createLearningExtractor({ client, modelSelector }) {
 
         const parsed = parseModelOutput(response.responseText);
         if (parsed.length > 0) {
-          return parsed;
+          learnings = parsed;
         }
       } catch {
         // Non-blocking: fallback below.
       }
 
-      return buildFallback(task, result);
+      if (learnings.length === 0) {
+        learnings = buildFallback(task, result);
+      }
+
+      const sanitized = learnings.map(sanitizeLearning);
+      await persistLearnings(pool, task.id, sanitized);
+      return sanitized;
     },
   };
 }

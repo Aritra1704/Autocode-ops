@@ -3,6 +3,7 @@ import { routeFileEdit } from '../agents/fileEditRouter.js';
 import { writeFile } from '../agents/fileWriter.js';
 import { patchFile } from '../agents/filePatcher.js';
 import { verifyAndCommit } from '../agents/gitVerificationAgent.js';
+import { checkAndEvictIfNeeded } from '../intelligence/modelResourceGuard.js';
 
 function buildCommitMessage(instruction) {
   const summary = String(instruction ?? '').slice(0, 72).trim();
@@ -19,6 +20,8 @@ export async function runOllamaSubAgent(input) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
+      await checkAndEvictIfNeeded();
+
       const routed = await routeFileEdit({
         filePath: input.filePath,
         taskDescription: input.instruction,
