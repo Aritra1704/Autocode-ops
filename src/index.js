@@ -151,6 +151,18 @@ function createControlOrchestrator(activeTaskIds, pool) {
     async listSkills() {
       return [];
     },
+    async createTask(description, options) {
+      // Simple task creation from plain text (used by Telegram plain-text handler).
+      // Derives a short title from the first 80 chars of the description.
+      const title = String(description ?? '').trim().slice(0, 80);
+      const result = await pool.query(
+        `INSERT INTO tasks (title, description, priority, source, status)
+         VALUES ($1, $2, 'medium', $3, 'pending')
+         RETURNING *`,
+        [title, description, options?.source ?? 'manual']
+      );
+      return result.rows[0];
+    },
     async createPlannedTask(contract, options) {
       const title = buildTaskTitleFromContract(contract);
       const description = buildTaskDescriptionFromContract(contract);
@@ -317,7 +329,13 @@ async function bootstrap() {
         throw new Error('Telegram module does not export createTelegramBot or startTelegramBot');
       }
 
-      return createTelegramBot({ logger, pool, geminiDriver, workspaceRoot });
+      return createTelegramBot({
+        logger,
+        pool,
+        geminiDriver,
+        workspaceRoot,
+        orchestrator: createControlOrchestrator(activeTaskIds, pool),
+      });
     });
   }
 
@@ -351,14 +369,30 @@ async function bootstrap() {
 
   startGeminiReviewLoop(pool, geminiClient, logger);
 
+  function tgNotify(text) {
+    if (telegramBot && typeof telegramBot.sendMessage === 'function') {
+      telegramBot.sendMessage(text).catch((err) => {
+        logger.warn({ err }, 'Failed to send Telegram progress notification');
+      });
+    }
+  }
+
   async function runTask(task) {
+    const shortId = task.id?.slice(0, 8) ?? '?';
     try {
       logger.info({ taskId: task.id, title: task.title }, 'Starting task');
+      tgNotify(`🧠 Architecting task\n*${task.title}*\nID: ${shortId}`);
+
       const context = await loadTaskContext(task, {
         workspaceRoot: task.project_path ?? workspaceRoot,
       });
+
+      function onProgress(message) {
+        tgNotify(message);
+      }
+
       const result = geminiDriver
-        ? await geminiDriver.runTask(task, context.context)
+        ? await geminiDriver.runTask(task, context.context, { onProgress })
         : {
             success: false,
             stepsCompleted: 0,
@@ -370,8 +404,15 @@ async function bootstrap() {
         { taskId: task.id, success: result.success, stepsCompleted: result.stepsCompleted },
         'Task finished'
       );
+
+      if (result.success) {
+        tgNotify(`✅ Task done\nTitle: ${task.title}\nID: ${shortId}\nSteps completed: ${result.stepsCompleted}`);
+      } else {
+        tgNotify(`❌ Task failed\nTitle: ${task.title}\nID: ${shortId}\nReason: ${result.error ?? 'unknown'}`);
+      }
     } catch (error) {
       logger.error({ err: error, taskId: task.id }, 'Task execution failed');
+      tgNotify(`❌ Task crashed\nTitle: ${task.title}\nID: ${shortId}\nError: ${error?.message ?? 'unknown'}`);
       await failTask(pool, task.id, error).catch((updateError) => {
         logger.error(
           { err: updateError, taskId: task.id },

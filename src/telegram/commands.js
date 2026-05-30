@@ -18,8 +18,29 @@ function formatTaskLine(task) {
   ].join('\n');
 }
 
+function shortId(uuid) {
+  return uuid?.slice(0, 8) ?? '?';
+}
+
+function taskConfirmation(task) {
+  return [
+    '✅ Task queued',
+    `Title: ${task.title}`,
+    `ID: ${shortId(task.id)}`,
+    `Status: pending`,
+    '',
+    'Stallone will start on it shortly.',
+  ].join('\n');
+}
+
 export function createTelegramHandlers(dependencies) {
   const { orchestrator, logger, onKill, pool } = dependencies;
+
+  async function createTaskAndReply(ctx, description) {
+    const task = await orchestrator.createTask(description, { source: 'telegram' });
+    logger.info({ taskId: task.id, title: task.title }, 'Task created from Telegram');
+    await ctx.reply(taskConfirmation(task));
+  }
 
   return {
     start: async (ctx) => {
@@ -120,16 +141,17 @@ export function createTelegramHandlers(dependencies) {
       const description = ctx.message.text.replace(/^\/add\s*/, '').trim();
 
       if (!description) {
-        await ctx.reply('Usage: /add <task description>');
+        await ctx.reply('Usage: /add <task description>\nOr just send a plain message to queue a task.');
         return;
       }
 
-      const task = await orchestrator.createTask(description, { source: 'telegram' });
-      logger.info({ taskId: task.id, title: task.title }, 'Task created from Telegram');
+      await createTaskAndReply(ctx, description);
+    },
 
-      await ctx.reply(
-        `Task created.\nTitle: ${task.title}\nID: ${task.id}\nPriority: ${task.priority}\nStatus: ${task.status}`
-      );
+    text: async (ctx) => {
+      const text = ctx.message.text?.trim();
+      if (!text || text.startsWith('/')) return;
+      await createTaskAndReply(ctx, text);
     },
 
     approvals: async (ctx) => {
@@ -433,4 +455,7 @@ export function registerTelegramCommands(bot, dependencies) {
   bot.command('disable_skill', handlers.disableSkill);
   bot.command('kill', handlers.kill);
   bot.action(APPROVAL_ACTION_PATTERN, handlers.approvalAction);
+
+  // Plain text messages → create task (no LLM, deterministic reply)
+  bot.on('text', handlers.text);
 }

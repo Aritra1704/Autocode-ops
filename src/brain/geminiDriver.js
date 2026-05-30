@@ -62,7 +62,9 @@ export function createGeminiDriver(pool, options = {}) {
   const gemini = geminiClient;
 
   return {
-    async runTask(task, context) {
+    async runTask(task, context, options = {}) {
+      const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+      const shortId = task.id?.slice(0, 8) ?? '?';
       // task: { id, title, description, project_path, project_name }
       // context: string  (assembled by loadTaskContext)
       //
@@ -202,6 +204,7 @@ export function createGeminiDriver(pool, options = {}) {
 
         // --- Tool: run_ollama ---
         if (toolName === 'run_ollama') {
+          onProgress?.(`🛠 Step ${stepNumber}: writing \`${toolCall.filePath ?? 'file'}\`\nTask: ${task.title} (${shortId})`);
           const result = await runOllamaSubAgent({
             instruction: toolCall.instruction,
             filePath: toolCall.filePath,
@@ -222,6 +225,7 @@ export function createGeminiDriver(pool, options = {}) {
 
         // --- Tool: run_shell ---
         if (toolName === 'run_shell') {
+          onProgress?.(`⚙️ Step ${stepNumber}: running shell\n\`${(toolCall.command ?? '').slice(0, 120)}\`\nTask: ${task.title} (${shortId})`);
           const shellCwd = path.resolve(task.project_path ?? workspaceRoot, toolCall.cwd ?? '.');
           let toolResultMessage;
           try {
@@ -245,6 +249,7 @@ export function createGeminiDriver(pool, options = {}) {
 
         // --- Tool: ask_human ---
         if (toolName === 'ask_human') {
+          onProgress?.(`🙋 Step ${stepNumber}: asking for your input\n${toolCall.question ?? ''}\nTask: ${task.title} (${shortId})`);
           // Check if human is actually online before delegating
           const presence = await computePresenceScore(pool, workspaceRoot).catch(() => ({ score: 0 }));
           const online = isHumanOnline(presence.score);
