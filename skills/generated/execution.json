@@ -1,0 +1,7 @@
+{
+  "name": "execution",
+  "description": "Successfully created a minimal Spring Boot CLI app using Maven and verified the build process.",
+  "version": 1,
+  "source_type": "generated",
+  "steps": []
+}

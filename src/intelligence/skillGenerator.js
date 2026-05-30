@@ -112,7 +112,7 @@ export function createSkillGenerator(pool, options = {}) {
         ? freshLearnings
             .map(normalizeLearningRow)
             .filter(
-              (row) => row.category === taskCategory && row.confidenceScore >= 5 && row.observation
+              (row) => row.category === taskCategory && row.confidenceScore >= 7 && row.observation
             )
         : (
             await pool.query(
@@ -123,7 +123,7 @@ export function createSkillGenerator(pool, options = {}) {
                  created_at
                FROM learnings
               WHERE category = $1
-                AND confidence_score >= 5
+                AND confidence_score >= 7
               ORDER BY times_applied DESC, created_at DESC
               LIMIT 20`,
               [taskCategory]
@@ -131,7 +131,8 @@ export function createSkillGenerator(pool, options = {}) {
           ).rows.map(normalizeLearningRow);
 
       const qualifyingCluster = clusterLearnings(rows)
-        .filter((cluster) => cluster.members.length >= 3)
+        // Require ≥2 members AND topConfidenceScore ≥7 — excludes score-6 fallback clusters
+        .filter((cluster) => cluster.members.length >= 2 && cluster.topConfidenceScore >= 7)
         .sort((left, right) => {
           // Prefer highest top confidence score first, then largest cluster
           if (right.topConfidenceScore !== left.topConfidenceScore) {

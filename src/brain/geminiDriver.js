@@ -322,8 +322,8 @@ export function createGeminiDriver(pool, options = {}) {
               // cluster includes historical learnings across all tasks, not just this one.
               const generationResult = await skillGenerator.checkAndGenerate(topCategory);
 
-              if (generationResult.generated && skillManager) {
-                await skillManager.syncToDatabase();
+              if (generationResult.generated) {
+                await skillGenerator.syncToDatabase();
               }
             }
           }
