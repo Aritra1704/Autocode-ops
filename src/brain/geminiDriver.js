@@ -13,7 +13,24 @@ import { checkAndEvictIfNeeded } from '../intelligence/modelResourceGuard.js';
 
 const execFileAsync = promisify(execFile);
 
-const MAX_STEPS = 30;
+// Default step budgets by task type. Coordinators (epic/story/task) never
+// execute steps directly — they call plan and park. Leaf types get hard limits.
+const STEP_BUDGET_BY_TYPE = {
+  epic: 0,
+  story: 0,
+  task: 0,
+  coordinator: 0,
+  subtask: 15,
+  standard: 15,
+  testcase: 10,
+  bug: 10,
+};
+
+function resolveStepBudget(task) {
+  const fromDb = task.step_budget != null ? Number(task.step_budget) : null;
+  if (fromDb !== null && fromDb > 0) return fromDb;
+  return STEP_BUDGET_BY_TYPE[task.task_type] ?? 15;
+}
 
 // Calls Ollama /api/chat with a full message history and returns the response text.
 async function ollamaChat({ model, system, messages, timeoutMs = 300_000 }) {
@@ -80,9 +97,11 @@ export function createGeminiDriver(pool, options = {}) {
       let planAlreadyCalled = false;
 
       // Build the system prompt
+      const stepBudget = resolveStepBudget(task);
       const systemPrompt = [
         'You are Stallone, an autonomous coding agent.',
         'You work by calling tools in sequence until the task is complete.',
+        '',
         'Available tools (call as JSON in your response):',
         '  { "tool": "run_ollama", "filePath": "relative/path/to/file.ext", "instruction": "...", "context": "..." }',
         '    filePath must be a path RELATIVE to the workspace root (e.g. "hello.txt", "src/index.js"). Never use an absolute path or a directory.',
@@ -90,20 +109,33 @@ export function createGeminiDriver(pool, options = {}) {
         '  { "tool": "run_shell", "command": "...", "cwd": "relative/path" }',
         '    cwd is optional, relative to workspace root. command runs in a shell with a 60s timeout.',
         '    → runs a shell command to verify files exist, compile code, or run tests',
-        '  { "tool": "plan", "phases": [{ "title": "...", "description": "...", "acceptance_criteria": "..." }] }',
-        '    → creates child tasks in the DB and parks this coordinator task while the phases run.',
+        '  { "tool": "plan", "tasks": [{ "title": "...", "description": "...", "task_type": "story|task|subtask|testcase|bug", "estimated_steps": N, "acceptance_criteria": "...", "children": [...] }] }',
+        '    → creates child tasks in the DB and parks this coordinator task while they run.',
         '    Call this ONLY for high-level multi-phase goals. Read the project first with run_shell before calling plan.',
         '    Steps before calling plan:',
         '      1. run_shell: cat README.md (understand the project)',
         '      2. run_shell: ls src/ (see what is already built)',
         '      3. run_shell: cat docs/PHASES.md or equivalent spec (understand what needs to be done)',
-        '      4. plan: create only the phases that are NOT already complete',
+        '      4. plan: create only the work that is NOT already complete',
+        '    task_type guide: story = phase/feature area (has children), subtask = atomic code/config work, testcase = write+run a test, bug = targeted fix',
+        '    BACKWARD COMPAT: "phases" array is also accepted (treated as stories without children).',
         '  { "tool": "ask_human", "question": "...", "context": "..." }',
         '    → parks the task and waits for the human to push a commit',
         '  { "tool": "done", "summary": "..." }',
         '    → marks the task as complete',
         '  { "tool": "fail", "reason": "..." }',
         '    → marks the task as failed',
+        '',
+        '━━━ ATOMIC UNIT RULE (non-negotiable) ━━━',
+        `This task has a step budget of ${stepBudget} steps. You MUST complete within this budget.`,
+        'Before planning any child task, estimate its steps. If estimated steps > 15, split it into smaller subtasks.',
+        'NEVER combine multiple concerns into one task if total estimated steps exceed 15.',
+        '',
+        '━━━ TEST SPLITTING RULE (always apply) ━━━',
+        'Any work involving "testing", "verifying", or "confirming" MUST be split into exactly two tasks:',
+        '  1. task_type: "subtask" — title "Write <test file>" — only creates the pytest/jest file, no execution',
+        '  2. task_type: "testcase" — title "Run <test file>" — runs the test command and reports pass/fail',
+        'NEVER combine writing and running tests into a single task.',
         '',
         'Rules:',
         '- Call one tool per response.',
@@ -127,8 +159,9 @@ export function createGeminiDriver(pool, options = {}) {
         },
       ];
 
-      // Main loop
-      while (stepNumber < MAX_STEPS) {
+      // Main loop — honour per-task step budget (0 = coordinator, never enters loop)
+      const maxSteps = stepBudget > 0 ? stepBudget : 0;
+      while (maxSteps > 0 && stepNumber < maxSteps) {
         stepNumber += 1;
 
         // Check token budget — checkpoint at 70%
@@ -156,9 +189,28 @@ export function createGeminiDriver(pool, options = {}) {
               retries: 1,
             });
             responseText = geminiResponse.responseText;
-            const tokensUsed =
-              (geminiResponse.promptEvalCount ?? 0) + (geminiResponse.evalCount ?? 0);
+            const promptTokens = geminiResponse.promptEvalCount ?? 0;
+            const outputTokens = geminiResponse.evalCount ?? 0;
+            const tokensUsed = promptTokens + outputTokens;
             if (tokensUsed > 0) budget.add(tokensUsed);
+
+            // Persist token usage to agent_logs for cost tracking
+            if (tokensUsed > 0) {
+              pool.query(
+                `INSERT INTO agent_logs (task_id, step_number, step_type, model_used, status, input_summary, output_summary)
+                 VALUES ($1, $2, 'llm_call', $3, 'success', $4, $5)`,
+                [
+                  task.id,
+                  stepNumber,
+                  config.geminiDefaultModel,
+                  String(promptTokens),
+                  String(outputTokens),
+                ]
+              ).catch((err) => {
+                // Non-fatal — never let logging break task execution
+                console.warn('[geminiDriver] agent_logs insert failed:', err?.message);
+              });
+            }
           } else {
             // Local-only: use Ollama /api/chat with full conversation history
             responseText = await ollamaChat({
@@ -270,8 +322,80 @@ export function createGeminiDriver(pool, options = {}) {
           }
 
           planAlreadyCalled = true;
-          const phases = Array.isArray(toolCall.phases) ? toolCall.phases : [];
+
+          // Support both new "tasks" format and legacy "phases" format
+          const rawItems = Array.isArray(toolCall.tasks)
+            ? toolCall.tasks
+            : Array.isArray(toolCall.phases)
+              ? toolCall.phases.map((p) => ({ ...p, task_type: 'story' }))
+              : [];
+
           const client = await pool.connect();
+
+          // Returns step_budget for a given task_type
+          function budgetForType(taskType) {
+            return STEP_BUDGET_BY_TYPE[taskType] ?? 15;
+          }
+
+          // Recursively inserts a task and its children. Returns the inserted id.
+          async function insertTaskTree(itemData, parentId, parentDepth, sequencePreviousId) {
+            const title = String(itemData.title ?? '').trim();
+            const description = String(itemData.description ?? '').trim();
+            const acceptanceCriteria = String(itemData.acceptance_criteria ?? '').trim();
+            const taskType = String(itemData.task_type ?? 'subtask').trim();
+            const estimatedSteps = itemData.estimated_steps != null ? Number(itemData.estimated_steps) : null;
+            const children = Array.isArray(itemData.children) ? itemData.children : [];
+            const isParent = children.length > 0;
+            const depth = parentDepth + 1;
+
+            // Parent tasks (those with children) wait for their children
+            const initialStatus = isParent ? 'waiting_children' : 'pending';
+            // Parent tasks are coordinators by nature
+            const effectiveType = isParent && !['epic', 'story', 'task', 'coordinator'].includes(taskType)
+              ? 'task'
+              : taskType;
+            const budget = isParent ? 0 : budgetForType(effectiveType);
+
+            const fullDescription = acceptanceCriteria
+              ? `${description}\n\n## Acceptance Criteria\n${acceptanceCriteria}`
+              : description;
+
+            const insert = await client.query(
+              `INSERT INTO tasks (
+                 title, description, priority, source, status,
+                 task_type, parent_task_id, depends_on,
+                 project_name, project_path,
+                 depth, estimated_steps, step_budget
+               )
+               VALUES ($1, $2, 'medium', 'coordinator', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               RETURNING id`,
+              [
+                title || 'Untitled task',
+                fullDescription,
+                initialStatus,
+                effectiveType,
+                parentId,
+                sequencePreviousId ?? null,
+                task.project_name ?? null,
+                task.project_path ?? null,
+                depth,
+                estimatedSteps,
+                budget,
+              ]
+            );
+
+            const insertedId = insert.rows[0]?.id ?? null;
+
+            // Insert children sequentially (each depends on the previous sibling)
+            if (isParent && insertedId) {
+              let prevChildId = null;
+              for (const child of children) {
+                prevChildId = await insertTaskTree(child, insertedId, depth, prevChildId);
+              }
+            }
+
+            return insertedId;
+          }
 
           try {
             await client.query('BEGIN');
@@ -279,57 +403,27 @@ export function createGeminiDriver(pool, options = {}) {
             let previousId = null;
             let insertedCount = 0;
 
-            for (let index = 0; index < phases.length; index += 1) {
-              const phase = phases[index] ?? {};
-              const title = String(phase.title ?? '').trim();
-              const description = String(phase.description ?? '').trim();
-              const acceptanceCriteria = String(phase.acceptance_criteria ?? '').trim();
-
-              if (!title || !description || !acceptanceCriteria) {
-                throw new Error(`plan phase ${index + 1} is missing title, description, or acceptance_criteria`);
+            for (const item of rawItems) {
+              if (!item.title) {
+                throw new Error('plan task is missing a title');
               }
-
-              const insert = await client.query(
-                `INSERT INTO tasks (
-                   title,
-                   description,
-                   priority,
-                   source,
-                   status,
-                   task_type,
-                   parent_task_id,
-                   depends_on,
-                   phase_index,
-                   project_name,
-                   project_path
-                 )
-                 VALUES ($1, $2, 'medium', 'coordinator', 'pending', 'standard', $3, $4, $5, $6, $7)
-                 RETURNING id`,
-                [
-                  title,
-                  `${description}\n\n## Acceptance Criteria\n${acceptanceCriteria}`,
-                  task.id,
-                  previousId,
-                  index,
-                  task.project_name ?? null,
-                  task.project_path ?? null,
-                ]
-              );
-
-              previousId = insert.rows[0]?.id ?? null;
+              previousId = await insertTaskTree(item, task.id, task.depth ?? 0, previousId);
               insertedCount += 1;
             }
 
             await client.query(
               `UPDATE tasks
                SET status = 'waiting_children',
-                   task_type = 'coordinator'
+                   task_type = CASE
+                     WHEN task_type IN ('standard', 'subtask', 'testcase', 'bug') THEN 'coordinator'
+                     ELSE task_type
+                   END
                WHERE id = $1`,
               [task.id]
             );
 
             await client.query('COMMIT');
-            onProgress?.(`📋 Project plan created\n${task.title}\n${insertedCount} phases queued`);
+            onProgress?.(`📋 Project plan created\n${task.title}\n${insertedCount} top-level tasks queued`);
 
             return {
               success: true,
@@ -384,8 +478,17 @@ export function createGeminiDriver(pool, options = {}) {
         break;
       }
 
-      if (stepNumber >= MAX_STEPS && !lastError) {
-        lastError = `Reached maximum steps (${MAX_STEPS}) without completing the task`;
+      const hitBudget = maxSteps > 0 && stepNumber >= maxSteps && !taskSucceeded && !lastError;
+      if (hitBudget) {
+        // Graceful replan — not a hard failure
+        const completedSummary = steps.map((s) => s.summary ?? s.tool).filter(Boolean).join('; ');
+        return {
+          success: false,
+          needsReplan: true,
+          stepsCompleted: stepNumber,
+          error: `Hit step budget (${maxSteps}) without completing the task`,
+          completedStepsSummary: completedSummary || 'no steps recorded',
+        };
       }
 
       await pool.query(

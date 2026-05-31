@@ -213,7 +213,7 @@ async function leaseNextPendingTask(pool) {
     const result = await client.query(
       `SELECT *
        FROM tasks
-       WHERE status = 'pending'
+       WHERE status IN ('pending', 'needs_replan')
          AND (
            depends_on IS NULL
            OR EXISTS (
@@ -224,7 +224,10 @@ async function leaseNextPendingTask(pool) {
            )
          )
          AND (scheduled_at IS NULL OR scheduled_at <= NOW())
-       ORDER BY priority DESC, created_at ASC
+       ORDER BY
+         CASE WHEN status = 'needs_replan' THEN 0 ELSE 1 END ASC,
+         priority DESC,
+         created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`
     );
@@ -254,19 +257,21 @@ async function leaseNextPendingTask(pool) {
 }
 
 async function completeTask(pool, taskId, result) {
+  const status = result.success ? 'done' : result.needsReplan ? 'needs_replan' : 'failed';
   await pool.query(
     `UPDATE tasks
      SET status = $2,
-         completed_at = NOW(),
+         completed_at = CASE WHEN $2 = 'needs_replan' THEN NULL ELSE NOW() END,
          result = $3::jsonb
      WHERE id = $1`,
     [
       taskId,
-      result.success ? 'done' : 'failed',
+      status,
       JSON.stringify({
         success: result.success,
         stepsCompleted: result.stepsCompleted,
         error: result.error,
+        completedStepsSummary: result.completedStepsSummary ?? null,
       }),
     ]
   );
@@ -485,20 +490,37 @@ async function bootstrap() {
 
   async function runTask(task) {
     const shortId = task.id?.slice(0, 8) ?? '?';
+    const wasReplan = task.status === 'needs_replan';
+
     try {
-      logger.info({ taskId: task.id, title: task.title }, 'Starting task');
-      tgNotify(`🧠 Architecting task\n*${task.title}*\nID: ${shortId}`);
+      logger.info({ taskId: task.id, title: task.title, wasReplan }, 'Starting task');
+
+      if (wasReplan) {
+        tgNotify(`🔄 Replanning\n*${task.title}*\nID: ${shortId}\nResuming from previous attempt`);
+      } else {
+        tgNotify(`🧠 Architecting task\n*${task.title}*\nID: ${shortId}`);
+      }
 
       const context = await loadTaskContext(task, {
         workspaceRoot: task.project_path ?? workspaceRoot,
       });
+
+      // If resuming a needs_replan task, prepend a resume note to the description
+      // so Gemini knows what was already done and focuses only on what remains.
+      let effectiveTask = task;
+      if (wasReplan && task.result?.completedStepsSummary) {
+        effectiveTask = {
+          ...task,
+          description: `RESUME NOTE: This task previously hit its step budget.\nCompleted steps: ${task.result.completedStepsSummary}\nFocus only on what is NOT yet done.\n\n---\n\n${task.description}`,
+        };
+      }
 
       function onProgress(message) {
         tgNotify(message);
       }
 
       const result = geminiDriver
-        ? await geminiDriver.runTask(task, context.context, { onProgress })
+        ? await geminiDriver.runTask(effectiveTask, context.context, { onProgress })
         : {
             success: false,
             stepsCompleted: 0,
@@ -515,12 +537,14 @@ async function bootstrap() {
 
       await completeTask(pool, task.id, result);
       logger.info(
-        { taskId: task.id, success: result.success, stepsCompleted: result.stepsCompleted },
+        { taskId: task.id, success: result.success, stepsCompleted: result.stepsCompleted, needsReplan: result.needsReplan ?? false },
         'Task finished'
       );
 
       if (result.success) {
         tgNotify(`✅ Task done\nTitle: ${task.title}\nID: ${shortId}\nSteps completed: ${result.stepsCompleted}`);
+      } else if (result.needsReplan) {
+        tgNotify(`✂️ Task split needed\nTitle: ${task.title}\nID: ${shortId}\nHit step budget at step ${result.stepsCompleted} — re-queued for replanning`);
       } else {
         tgNotify(`❌ Task failed\nTitle: ${task.title}\nID: ${shortId}\nReason: ${result.error ?? 'unknown'}`);
       }
