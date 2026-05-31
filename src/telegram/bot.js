@@ -78,6 +78,11 @@ export async function startTelegramBot(dependencies) {
   const launchPromise = bot
     .launch({ dropPendingUpdates: false })
     .catch((error) => {
+      // 409 Conflict means a previous instance is still polling — not fatal, just log
+      if (error?.response?.error_code === 409) {
+        logger.warn('Telegram 409 conflict — previous instance still active, polling will resume shortly');
+        return;
+      }
       logger.error({ err: error }, 'Telegram polling stopped unexpectedly');
       throw error;
     });

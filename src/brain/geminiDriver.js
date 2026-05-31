@@ -77,6 +77,7 @@ export function createGeminiDriver(pool, options = {}) {
       let lastError = null;
       let usedOllamaFallback = false;
       let taskSucceeded = false;
+      let planAlreadyCalled = false;
 
       // Build the system prompt
       const systemPrompt = [
@@ -89,6 +90,14 @@ export function createGeminiDriver(pool, options = {}) {
         '  { "tool": "run_shell", "command": "...", "cwd": "relative/path" }',
         '    cwd is optional, relative to workspace root. command runs in a shell with a 60s timeout.',
         '    → runs a shell command to verify files exist, compile code, or run tests',
+        '  { "tool": "plan", "phases": [{ "title": "...", "description": "...", "acceptance_criteria": "..." }] }',
+        '    → creates child tasks in the DB and parks this coordinator task while the phases run.',
+        '    Call this ONLY for high-level multi-phase goals. Read the project first with run_shell before calling plan.',
+        '    Steps before calling plan:',
+        '      1. run_shell: cat README.md (understand the project)',
+        '      2. run_shell: ls src/ (see what is already built)',
+        '      3. run_shell: cat docs/PHASES.md or equivalent spec (understand what needs to be done)',
+        '      4. plan: create only the phases that are NOT already complete',
         '  { "tool": "ask_human", "question": "...", "context": "..." }',
         '    → parks the task and waits for the human to push a commit',
         '  { "tool": "done", "summary": "..." }',
@@ -103,8 +112,10 @@ export function createGeminiDriver(pool, options = {}) {
         '- If run_ollama fails, retry immediately with a clearer or simpler instruction. Do NOT skip a file and call done.',
         '- Only call done when EVERY file required by the task has been successfully written (run_ollama returned success for each one). Verify this before calling done.',
         '- After writing all files, use run_shell to verify they exist and that the code compiles. Fix any errors before calling done.',
+        '- If the task description includes acceptance criteria, run the relevant verification command with run_shell and only call done once the acceptance criteria pass.',
         '- If run_ollama fails 3 consecutive times for the same file, call fail explaining which file could not be written.',
         '- Use ask_human only when you are genuinely stuck and retrying will not help.',
+        '- Call plan at most once per task.',
         '- Never output plain text — always output a JSON tool call.',
       ].join('\n');
 
@@ -245,6 +256,95 @@ export function createGeminiDriver(pool, options = {}) {
           messages.push({ role: 'assistant', content: responseText });
           messages.push({ role: 'user', content: toolResultMessage });
           continue;
+        }
+
+        // --- Tool: plan ---
+        if (toolName === 'plan') {
+          if (planAlreadyCalled) {
+            messages.push({ role: 'assistant', content: responseText });
+            messages.push({
+              role: 'user',
+              content: 'plan already called — you can only plan once.',
+            });
+            continue;
+          }
+
+          planAlreadyCalled = true;
+          const phases = Array.isArray(toolCall.phases) ? toolCall.phases : [];
+          const client = await pool.connect();
+
+          try {
+            await client.query('BEGIN');
+
+            let previousId = null;
+            let insertedCount = 0;
+
+            for (let index = 0; index < phases.length; index += 1) {
+              const phase = phases[index] ?? {};
+              const title = String(phase.title ?? '').trim();
+              const description = String(phase.description ?? '').trim();
+              const acceptanceCriteria = String(phase.acceptance_criteria ?? '').trim();
+
+              if (!title || !description || !acceptanceCriteria) {
+                throw new Error(`plan phase ${index + 1} is missing title, description, or acceptance_criteria`);
+              }
+
+              const insert = await client.query(
+                `INSERT INTO tasks (
+                   title,
+                   description,
+                   priority,
+                   source,
+                   status,
+                   task_type,
+                   parent_task_id,
+                   depends_on,
+                   phase_index,
+                   project_name,
+                   project_path
+                 )
+                 VALUES ($1, $2, 'medium', 'coordinator', 'pending', 'standard', $3, $4, $5, $6, $7)
+                 RETURNING id`,
+                [
+                  title,
+                  `${description}\n\n## Acceptance Criteria\n${acceptanceCriteria}`,
+                  task.id,
+                  previousId,
+                  index,
+                  task.project_name ?? null,
+                  task.project_path ?? null,
+                ]
+              );
+
+              previousId = insert.rows[0]?.id ?? null;
+              insertedCount += 1;
+            }
+
+            await client.query(
+              `UPDATE tasks
+               SET status = 'waiting_children',
+                   task_type = 'coordinator'
+               WHERE id = $1`,
+              [task.id]
+            );
+
+            await client.query('COMMIT');
+            onProgress?.(`📋 Project plan created\n${task.title}\n${insertedCount} phases queued`);
+
+            return {
+              success: true,
+              stepsCompleted: stepNumber,
+              error: null,
+              isCoordinator: true,
+            };
+          } catch (error) {
+            await client.query('ROLLBACK').catch(() => {});
+            lastError = error?.message ?? 'plan tool failed';
+            steps.push({ step: stepNumber, tool: 'plan', success: false, reason: lastError });
+            break;
+          } finally {
+            client.release();
+          }
         }
 
         // --- Tool: ask_human ---

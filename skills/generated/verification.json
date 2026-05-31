@@ -1,0 +1,7 @@
+{
+  "name": "verification",
+  "description": "Failures during task \"diag4: Write diag4/hi.txt. Use run_shell: mkdir -p diag4 && echo hi > diag4/hi.t\" involved: run_shell.",
+  "version": 1,
+  "source_type": "generated",
+  "steps": []
+}

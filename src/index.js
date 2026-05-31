@@ -196,10 +196,33 @@ async function leaseNextPendingTask(pool) {
 
   try {
     await client.query('BEGIN');
+    await client.query(
+      `UPDATE tasks AS pending
+       SET status = 'failed',
+           completed_at = NOW(),
+           result = jsonb_build_object(
+             'success', false,
+             'stepsCompleted', 0,
+             'error', 'dependency failed: ' || pending.depends_on::text
+           )
+       FROM tasks AS dependency
+       WHERE pending.status = 'pending'
+         AND pending.depends_on = dependency.id
+         AND dependency.status = 'failed'`
+    );
     const result = await client.query(
       `SELECT *
        FROM tasks
        WHERE status = 'pending'
+         AND (
+           depends_on IS NULL
+           OR EXISTS (
+             SELECT 1
+             FROM tasks AS dependency
+             WHERE dependency.id = tasks.depends_on
+               AND dependency.status = 'done'
+           )
+         )
          AND (scheduled_at IS NULL OR scheduled_at <= NOW())
        ORDER BY priority DESC, created_at ASC
        LIMIT 1
@@ -377,6 +400,89 @@ async function bootstrap() {
     }
   }
 
+  async function pollCoordinators() {
+    const result = await pool.query(
+      `SELECT id, title
+       FROM tasks
+       WHERE status = 'waiting_children'`
+    );
+
+    for (const coordinator of result.rows) {
+      const summary = await pool.query(
+        `SELECT
+           COUNT(*)::int AS total_count,
+           COUNT(*) FILTER (WHERE status = 'done')::int AS done_count,
+           COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_count
+         FROM tasks
+         WHERE parent_task_id = $1`,
+        [coordinator.id]
+      );
+      const counts = summary.rows[0] ?? { total_count: 0, done_count: 0, failed_count: 0 };
+      const totalCount = Number(counts.total_count ?? 0);
+      const doneCount = Number(counts.done_count ?? 0);
+      const failedCount = Number(counts.failed_count ?? 0);
+
+      if (failedCount > 0) {
+        const failedChildResult = await pool.query(
+          `SELECT id, title
+           FROM tasks
+           WHERE parent_task_id = $1
+             AND status = 'failed'
+           ORDER BY phase_index ASC NULLS LAST, created_at ASC
+           LIMIT 1`,
+          [coordinator.id]
+        );
+        const failedChild = failedChildResult.rows[0] ?? null;
+        const errorMessage = failedChild
+          ? `child task failed: ${failedChild.id}`
+          : 'child task failed';
+
+        const update = await pool.query(
+          `UPDATE tasks
+           SET status = 'failed',
+               completed_at = NOW(),
+               result = jsonb_build_object(
+                 'success', false,
+                 'stepsCompleted', $2::int,
+                 'error', $3::text
+               )
+           WHERE id = $1
+             AND status = 'waiting_children'
+           RETURNING id`,
+          [coordinator.id, doneCount, errorMessage]
+        );
+
+        if (update.rowCount > 0) {
+          tgNotify(
+            `❌ Project failed\nTitle: ${coordinator.title}\nCompleted phases: ${doneCount}/${totalCount}\nReason: ${errorMessage}`
+          );
+        }
+        continue;
+      }
+
+      if (doneCount === totalCount) {
+        const update = await pool.query(
+          `UPDATE tasks
+           SET status = 'done',
+               completed_at = NOW(),
+               result = jsonb_build_object(
+                 'success', true,
+                 'stepsCompleted', $2::int,
+                 'error', null
+               )
+           WHERE id = $1
+             AND status = 'waiting_children'
+           RETURNING id`,
+          [coordinator.id, doneCount]
+        );
+
+        if (update.rowCount > 0) {
+          tgNotify(`✅ Project complete: ${coordinator.title} — ${doneCount}/${totalCount} phases done`);
+        }
+      }
+    }
+  }
+
   async function runTask(task) {
     const shortId = task.id?.slice(0, 8) ?? '?';
     try {
@@ -398,6 +504,14 @@ async function bootstrap() {
             stepsCompleted: 0,
             error: 'Gemini driver is unavailable',
           };
+
+      if (result.isCoordinator) {
+        logger.info(
+          { taskId: task.id, stepsCompleted: result.stepsCompleted },
+          'Coordinator task is waiting on child tasks'
+        );
+        return;
+      }
 
       await completeTask(pool, task.id, result);
       logger.info(
@@ -432,6 +546,8 @@ async function bootstrap() {
     pollInFlight = true;
 
     try {
+      await pollCoordinators();
+
       while (!shuttingDown && activeTaskIds.size < MAX_CONCURRENT_TASKS) {
         const task = await leaseNextPendingTask(pool);
         if (!task) {
