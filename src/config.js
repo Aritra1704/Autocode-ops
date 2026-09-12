@@ -8,8 +8,7 @@ const envSchema = z.object({
   STALLONE_NAME: z.string().min(1).default('Stallone'),
   STALLONE_WORKSPACE_ROOT: z
     .string()
-    .min(1)
-    .default('/Users/aritrarpal/Documents/workspace_biz'),
+    .min(1, 'STALLONE_WORKSPACE_ROOT is required'),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   DATABASE_SCHEMA: z
     .string()
@@ -43,7 +42,9 @@ const envSchema = z.object({
   RAILWAY_DEPLOY_TIMEOUT_MS: z.coerce.number().int().positive().default(900000),
   GEMINI_API_KEY: z.string().optional(),
   GEMINI_DEFAULT_MODEL: z.string().default('gemini-2.5-flash'),
+  GEMINI_STEP_MODEL: z.string().default('gemini-2.5-flash-lite'),
   GEMINI_ESCALATION_MODEL: z.string().default('gemini-2.5-pro'),
+  GEMINI_STEP_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(4096),
   GEMINI_TASK_TOKEN_BUDGET: z.coerce.number().int().positive().default(50000),
   GEMINI_API_BASE_URL: z.string().url().default('https://generativelanguage.googleapis.com/v1beta'),
   GEMINI_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
@@ -157,7 +158,9 @@ export const config = {
   railwayDeployTimeoutMs: env.RAILWAY_DEPLOY_TIMEOUT_MS,
   geminiApiKey: env.GEMINI_API_KEY ?? '',
   geminiDefaultModel: env.GEMINI_DEFAULT_MODEL,
+  geminiStepModel: env.GEMINI_STEP_MODEL,
   geminiEscalationModel: env.GEMINI_ESCALATION_MODEL,
+  geminiStepMaxOutputTokens: env.GEMINI_STEP_MAX_OUTPUT_TOKENS,
   geminiTaskTokenBudget: env.GEMINI_TASK_TOKEN_BUDGET,
   geminiApiBaseUrl: env.GEMINI_API_BASE_URL,
   geminiRequestTimeoutMs: env.GEMINI_REQUEST_TIMEOUT_MS,

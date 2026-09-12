@@ -12,6 +12,7 @@ function sanitizeName(value) {
 
 function scrubSensitive(text) {
   // TODO(privacy): implement scrubSensitive — see docs/PRIVACY_AND_SECRETS.md
+  // TODO(privacy-phase-a): not yet implemented — patterns defined in docs/PRIVACY_AND_SECRETS.md
   return text;
 }
 

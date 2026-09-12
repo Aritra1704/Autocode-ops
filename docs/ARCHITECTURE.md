@@ -6,6 +6,16 @@
 
 ---
 
+## Mandatory Cross-Cutting Requirement — Privacy and Secrets
+
+> **Stallone must never store sensitive information in plaintext anywhere in the application or database. This is a hard architectural constraint with no bypass.**
+>
+> See [`docs/PRIVACY_AND_SECRETS.md`](./PRIVACY_AND_SECRETS.md) for the full specification: ingress scrubbing rules, encryption-at-rest requirements, log redaction, Gemini prompt hygiene, and the phased implementation plan.
+>
+> Every new feature, migration, or agent that persists data MUST comply. The Gemini review loop is configured to reject changes that remove or bypass privacy controls.
+
+---
+
 ## Core Philosophy
 
 > "Gemini thinks. Ollama types. Stallone ships."
@@ -392,7 +402,7 @@ OLLAMA_DEFAULT_ROUTER_MODEL=llama3.2:3b
 OLLAMA_DEFAULT_VERIFIER_MODEL=qwen2.5-coder:7b
 
 # Workspace (no more SSD isolation)
-STALLONE_WORKSPACE_ROOT=/Users/aritrarpal/Documents/workspace_biz
+STALLONE_WORKSPACE_ROOT=<your-workspace>
 
 # Presence
 PRESENCE_ONLINE_THRESHOLD=0.5
@@ -467,3 +477,176 @@ No `waiting_approval`. No `executionPolicy`. No approval gates for local work.
 
 *This document is the living spec for Stallone.*
 *When Stallone modifies his own architecture, he updates this document.*
+
+---
+
+## Planned: Resilience Layer & Model Governance
+
+*Added: May 28, 2026*
+*Status: Approved for implementation — implementation started May 28, 2026*
+
+> **Reminder (added May 28, 2026):** The review loop interval is hardcoded at 10 minutes as a
+> starting point. Monitor how often Gemini actually goes down in practice. If outages are rare,
+> bump to 30 minutes. If frequent, keep at 10. Revisit after one week of real use.
+
+This section describes the next phase of work. Nothing below is implemented yet.
+Implementation starts after this plan is reviewed and approved.
+
+---
+
+### Background: What Triggered This
+
+During live testing, Gemini returned `"This model is currently experiencing high demand"` mid-task.
+Stallone stopped. The task failed. This exposed two gaps:
+
+1. No record of which model ran which task — no audit trail
+2. No resource governance for local models — all four Ollama models can load simultaneously
+
+A temporary fallback (Ollama takes over when Gemini fails) was already added to `geminiDriver.js`.
+This plan adds the governance and review layer on top of that fallback.
+
+---
+
+### 1. Orchestrator Audit Trail
+
+**Problem:** A completed task shows `status: done` but there is no record of whether Gemini
+or Ollama handled the planning loop. If Ollama orchestrated a task during a Gemini outage,
+the output may be lower quality and should be reviewed when Gemini is back.
+
+**Solution:** Two new columns on the `tasks` table:
+
+```sql
+-- Migration 015: orchestrator audit + review queue
+ALTER TABLE tasks
+  ADD COLUMN orchestrator_model   text,          -- 'gemini-2.5-flash' | 'qwen2.5-coder:14b'
+  ADD COLUMN gemini_review_status text           -- NULL | 'pending' | 'approved' | 'needs_fix'
+    CHECK (gemini_review_status IN ('pending', 'approved', 'needs_fix'));
+```
+
+**Population rules:**
+
+| Scenario | `orchestrator_model` | `gemini_review_status` |
+|----------|----------------------|------------------------|
+| Gemini handled every step | `gemini-2.5-flash` | `NULL` — no review needed |
+| Ollama handled ≥1 step (fallback) | `qwen2.5-coder:14b` | `pending` |
+
+Written by `geminiDriver.js` at task completion. A boolean flag (`usedOllamaFallback`)
+is tracked during the tool loop and used to set the right values.
+
+---
+
+### 2. Deferred Gemini Review Queue
+
+**Problem:** When Ollama orchestrated a task, the committed code may be incomplete or
+incorrect. There is no mechanism to revisit this when Gemini becomes available again.
+
+**Solution:** A background review loop — lightweight, non-blocking, runs independently
+of the task queue.
+
+**How it works:**
+
+```
+Every 10 minutes (background):
+  1. Probe Gemini with a tiny test call (< 10 tokens)
+  2. If Gemini is unavailable → skip, try again next cycle
+  3. If Gemini is available → pull up to 3 tasks WHERE gemini_review_status = 'pending'
+                              ORDER BY priority DESC, completed_at ASC
+  4. For each task, send Gemini:
+       - Original task objective and success criteria
+       - The committed git diff (from task completion)
+       - Prompt: "Was this correctly and completely implemented?
+                  List specific issues if any. Be concise."
+  5. Gemini responds with one of:
+       approved  → set gemini_review_status = 'approved'
+       needs_fix → set gemini_review_status = 'needs_fix'
+                   auto-create a new pending task:
+                     title: "Fix: <original title>"
+                     description: Gemini's list of issues
+                     source: 'gemini_review'
+                     linked to original task id
+```
+
+**What this is not:**
+- It does not re-run tasks
+- It does not block new tasks from executing
+- It does not roll back commits
+- Reviews are processed lazily — no SLA
+
+**New file:** `src/intelligence/geminiReviewLoop.js`
+**Triggered from:** `src/index.js` boot sequence (background interval, not part of task queue)
+
+---
+
+### 3. Local Model Resource Guard
+
+**Problem:** Each Ollama model holds weights in RAM while loaded.
+Running more than two simultaneously risks starving the OS on a local Mac.
+
+| Model | RAM footprint |
+|-------|--------------|
+| `qwen2.5-coder:14b` (orchestrator fallback) | ~9 GB |
+| `qwen2.5-coder:7b` (writer / patcher) | ~5 GB |
+| `llama3.2:3b` (router) | ~2 GB |
+| `nomic-embed-text` (embeddings) | ~0.3 GB |
+
+**Hard limit:** Maximum 2 models loaded in RAM at any time.
+
+**How it works:**
+
+Ollama exposes `GET /api/ps` — returns currently loaded models with `size_vram` and `expires_at`.
+
+Before every Ollama call (in `ollamaSubAgent.js` and in `ollamaChat()`):
+
+```
+1. Call GET /api/ps
+2. Count loaded models
+3. If count < 2 → proceed
+4. If count >= 2 → find the model with the earliest expires_at (least recently used)
+                   POST /api/generate {model: <lru_model>, keep_alive: "0"}
+                   This signals Ollama to unload it immediately
+5. Proceed with the intended call
+```
+
+**Eviction priority (never evict):**
+- The model currently executing the active task step
+- The model about to be called
+
+**Disk space warning:**
+
+The existing `<10 GiB` halt stays. Add a new warning threshold:
+
+```
+< 25 GiB free → log WARN: "Low disk space. Pulling a new Ollama model may fail."
+```
+
+No auto-deletion of models. Warning only.
+
+**New utility:** `src/intelligence/modelResourceGuard.js`
+Called from `ollamaSubAgent.js` and `geminiDriver.js` (the `ollamaChat` function).
+
+---
+
+### 4. Implementation Order
+
+| Step | File(s) | What |
+|------|---------|------|
+| 1 | `db/migrations/015_orchestrator_audit.sql` | Add two columns to `tasks` |
+| 2 | `src/brain/geminiDriver.js` | Track `usedOllamaFallback`, write audit columns on completion |
+| 3 | `src/intelligence/modelResourceGuard.js` | New file — `/api/ps` check + LRU eviction |
+| 4 | `src/brain/ollamaSubAgent.js` | Call resource guard before each Ollama request |
+| 5 | `src/intelligence/geminiReviewLoop.js` | New file — background review loop |
+| 6 | `src/index.js` | Wire review loop into boot sequence |
+
+---
+
+### 5. Better Approach Considered
+
+An alternative was to replace Gemini entirely with a local model and remove the cloud dependency.
+This was rejected because:
+
+- `qwen2.5-coder:14b` is not reliably consistent at multi-turn JSON tool-calling across 20+ steps
+- Gemini Flash is cheap enough that cost is not the primary concern
+- The fallback-with-review pattern gives resilience without sacrificing quality
+- If Ollama model quality improves, the fallback can be promoted to primary with no architectural change
+
+The current model: **Gemini is primary, Ollama is the safety net, review closes the quality gap.**

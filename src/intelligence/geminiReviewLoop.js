@@ -32,7 +32,7 @@ async function runReviewCycle(pool, geminiClient, logger) {
 
   try {
     await geminiClient.generate({
-      model: config.geminiDefaultModel,
+      model: config.geminiStepModel,
       prompt: 'ping',
       retries: 0,
       options: { maxOutputTokens: 10 },
@@ -71,10 +71,11 @@ async function runReviewCycle(pool, geminiClient, logger) {
         'If approved, issues must be an empty array.',
       ].join('\n');
       const response = await geminiClient.generate({
-        model: config.geminiDefaultModel,
+        model: config.geminiStepModel,
         prompt,
         format: 'json',
         retries: 0,
+        options: { maxOutputTokens: config.geminiStepMaxOutputTokens },
       });
       const review = JSON.parse(cleanJsonResponse(response.responseText));
       const issues = Array.isArray(review?.issues)

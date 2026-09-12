@@ -7,14 +7,10 @@ import { createGeminiClient } from '../llm/providers/gemini.js';
 import { runOllamaSubAgent } from './ollamaSubAgent.js';
 import { delegateToHuman } from '../agents/humanDelegationAgent.js';
 import { computePresenceScore, isHumanOnline } from '../intelligence/onlineDetector.js';
-import { createTokenBudget } from '../intelligence/tokenBudget.js';
-import { createContextCompactor } from '../context/compactor.js';
 import { checkAndEvictIfNeeded } from '../intelligence/modelResourceGuard.js';
 
 const execFileAsync = promisify(execFile);
 
-// Default step budgets by task type. Coordinators (epic/story/task) never
-// execute steps directly — they call plan and park. Leaf types get hard limits.
 const STEP_BUDGET_BY_TYPE = {
   epic: 0,
   story: 0,
@@ -32,13 +28,65 @@ function resolveStepBudget(task) {
   return STEP_BUDGET_BY_TYPE[task.task_type] ?? 15;
 }
 
-// Calls Ollama /api/chat with a full message history and returns the response text.
-async function ollamaChat({ model, system, messages, timeoutMs = 300_000 }) {
+const RECENT_RESULTS_MAX = 3;
+const CAP_OLLAMA_RESULT = 2500;
+const CAP_SHELL_RESULT = 3000;
+const CAP_INSTRUCTION_LOG = 80;
+
+// One-line summary per completed step. Includes first 80 chars of run_ollama instruction
+// so the model has a hint of what was attempted when revisiting the same file.
+function formatCompactLog(steps) {
+  if (steps.length === 0) return '  (none yet)';
+  return steps
+    .map((s) => {
+      if (s.tool === 'run_ollama') {
+        const status = s.success ? `committed ${s.commitHash ?? '?'}` : `failed: ${s.error ?? '?'}`;
+        const hint = s.instruction ? ` ("${s.instruction.slice(0, CAP_INSTRUCTION_LOG)}")` : '';
+        return `  Step ${s.step} [run_ollama] ${s.filePath ?? 'file'}${hint} → ${status}`;
+      }
+      if (s.tool === 'run_shell') {
+        const cmd = (s.command ?? '').slice(0, 60);
+        return `  Step ${s.step} [run_shell] \`${cmd}\` → ${s.success ? 'succeeded' : 'failed'}`;
+      }
+      if (s.tool === 'ask_human') {
+        return `  Step ${s.step} [ask_human] → ${s.skipped ? 'skipped (offline)' : s.completed ? 'completed' : 'timed out'}`;
+      }
+      return `  Step ${s.step} [${s.tool}]`;
+    })
+    .join('\n');
+}
+
+// Fresh single-turn prompt per step. Uses a ring buffer of the last N tool results
+// so planning steps retain prior shell reads and debug loops retain prior errors.
+function buildStepPrompt(task, context, steps, recentResults) {
+  const parts = [
+    `Task: ${task.title}`,
+    ``,
+    `Description: ${task.description}`,
+    ``,
+    `Project context:`,
+    context,
+    ``,
+    `Steps completed so far (${steps.length}):`,
+    formatCompactLog(steps),
+  ];
+
+  if (recentResults.length > 0) {
+    parts.push(``, `Recent tool results (oldest → newest):`);
+    recentResults.forEach((r, i) => {
+      parts.push(`[${i + 1}] ${r}`);
+    });
+  }
+
+  parts.push(``, `What is your next tool call? Respond with JSON only.`);
+  return parts.join('\n');
+}
+
+// Ollama fallback — single-turn, same prompt structure as Gemini.
+async function ollamaGenerate({ model, system, prompt, timeoutMs = 300_000 }) {
   const baseUrl = config.ollamaBaseUrl.replace(/\/$/, '');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  const payload = [{ role: 'system', content: system }, ...messages];
 
   try {
     await checkAndEvictIfNeeded();
@@ -49,7 +97,10 @@ async function ollamaChat({ model, system, messages, timeoutMs = 300_000 }) {
       signal: controller.signal,
       body: JSON.stringify({
         model,
-        messages: payload,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: prompt },
+        ],
         stream: false,
         format: 'json',
         options: { temperature: 0.1 },
@@ -74,7 +125,6 @@ export function createGeminiDriver(pool, options = {}) {
     geminiClient = createGeminiClient(),
     learningExtractor = null,
     skillGenerator = null,
-    skillManager = null,
   } = options;
   const gemini = geminiClient;
 
@@ -82,21 +132,17 @@ export function createGeminiDriver(pool, options = {}) {
     async runTask(task, context, options = {}) {
       const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
       const shortId = task.id?.slice(0, 8) ?? '?';
-      // task: { id, title, description, project_path, project_name }
-      // context: string  (assembled by loadTaskContext)
-      //
-      // Returns: { success: boolean, stepsCompleted: number, error: string | null }
 
-      const budget = createTokenBudget(config.geminiTaskTokenBudget ?? 50000);
-      const compactor = createContextCompactor(pool);
       const steps = [];
+      const recentResults = []; // ring buffer — last RECENT_RESULTS_MAX tool outputs
       let stepNumber = 0;
       let lastError = null;
       let usedOllamaFallback = false;
+      let usedEscalation = false;
       let taskSucceeded = false;
       let planAlreadyCalled = false;
+      let consecutiveFailures = 0;
 
-      // Build the system prompt
       const stepBudget = resolveStepBudget(task);
       const systemPrompt = [
         'You are Stallone, an autonomous coding agent.',
@@ -151,83 +197,61 @@ export function createGeminiDriver(pool, options = {}) {
         '- Never output plain text — always output a JSON tool call.',
       ].join('\n');
 
-      // Build the conversation history
-      const messages = [
-        {
-          role: 'user',
-          content: `Task: ${task.title}\n\nDescription: ${task.description}\n\nContext:\n${context}`,
-        },
-      ];
-
-      // Main loop — honour per-task step budget (0 = coordinator, never enters loop)
       const maxSteps = stepBudget > 0 ? stepBudget : 0;
+
       while (maxSteps > 0 && stepNumber < maxSteps) {
         stepNumber += 1;
 
-        // Check token budget — checkpoint at 70%
-        if (budget.isNearLimit()) {
-          await compactor.saveCheckpoint(task.id, {
-            windowNumber: stepNumber,
-            stepsCompleted: steps,
-            stepsRemaining: [],
-            fileHashes: {},
-            keyDecisions: steps.map((s) => s.summary ?? '').filter(Boolean),
-            tokensUsed: budget.getUsed(),
-          });
-          // Continue — compaction is logged, loop goes on
-        }
+        // Build a fresh single-turn prompt — no accumulated history.
+        const stepPrompt = buildStepPrompt(task, context, steps, recentResults);
 
-        // Call the orchestrator LLM (Ollama locally, or Gemini if API key is set)
+        // Pick model: escalate to Pro after 3 consecutive failures, otherwise use flash-lite.
+        const stepModel = consecutiveFailures >= 3
+          ? config.geminiEscalationModel
+          : config.geminiStepModel;
+
         let responseText;
         try {
           if (config.geminiEnabled) {
             const geminiResponse = await gemini.generate({
-              model: config.geminiDefaultModel,
+              model: stepModel,
               system: systemPrompt,
-              prompt: messages.map((m) => `${m.role}: ${m.content}`).join('\n\n'),
+              prompt: stepPrompt,
               format: 'json',
               retries: 1,
+              options: { maxOutputTokens: config.geminiStepMaxOutputTokens },
             });
             responseText = geminiResponse.responseText;
+
+            if (consecutiveFailures >= 3) usedEscalation = true;
+
+            // Non-fatal token logging for cost tracking.
             const promptTokens = geminiResponse.promptEvalCount ?? 0;
             const outputTokens = geminiResponse.evalCount ?? 0;
-            const tokensUsed = promptTokens + outputTokens;
-            if (tokensUsed > 0) budget.add(tokensUsed);
-
-            // Persist token usage to agent_logs for cost tracking
-            if (tokensUsed > 0) {
+            if (promptTokens + outputTokens > 0) {
               pool.query(
                 `INSERT INTO agent_logs (task_id, step_number, step_type, model_used, status, input_summary, output_summary)
                  VALUES ($1, $2, 'llm_call', $3, 'success', $4, $5)`,
-                [
-                  task.id,
-                  stepNumber,
-                  config.geminiDefaultModel,
-                  String(promptTokens),
-                  String(outputTokens),
-                ]
+                [task.id, stepNumber, stepModel, String(promptTokens), String(outputTokens)]
               ).catch((err) => {
-                // Non-fatal — never let logging break task execution
                 console.warn('[geminiDriver] agent_logs insert failed:', err?.message);
               });
             }
           } else {
-            // Local-only: use Ollama /api/chat with full conversation history
-            responseText = await ollamaChat({
+            responseText = await ollamaGenerate({
               model: config.ollamaModelOrchestrator,
               system: systemPrompt,
-              messages,
+              prompt: stepPrompt,
             });
           }
         } catch (geminiError) {
           if (config.geminiEnabled) {
-            // Gemini failed (rate limit, network, high demand) — fall back to local Ollama for this step
             try {
               usedOllamaFallback = true;
-              responseText = await ollamaChat({
+              responseText = await ollamaGenerate({
                 model: config.ollamaModelOrchestrator,
                 system: systemPrompt,
-                messages,
+                prompt: stepPrompt,
               });
             } catch (ollamaError) {
               lastError = `Gemini failed: ${geminiError?.message}. Ollama fallback also failed: ${ollamaError?.message}`;
@@ -239,7 +263,6 @@ export function createGeminiDriver(pool, options = {}) {
           }
         }
 
-        // Parse the tool call from Gemini's response
         let toolCall;
         try {
           const cleaned = responseText.trim().replace(/^```json\n?/, '').replace(/\n?```$/, '');
@@ -253,15 +276,16 @@ export function createGeminiDriver(pool, options = {}) {
 
         // --- Tool: done ---
         if (toolName === 'done') {
-          steps.push({ step: stepNumber, tool: 'done', summary: toolCall.summary });
+          steps.push({ step: stepNumber, tool: 'done' });
           taskSucceeded = true;
+          consecutiveFailures = 0;
           break;
         }
 
         // --- Tool: fail ---
         if (toolName === 'fail') {
           lastError = toolCall.reason ?? 'Gemini called fail';
-          steps.push({ step: stepNumber, tool: 'fail', reason: lastError });
+          steps.push({ step: stepNumber, tool: 'fail' });
           break;
         }
 
@@ -276,13 +300,24 @@ export function createGeminiDriver(pool, options = {}) {
             context: toolCall.context,
           });
 
-          const toolResultMessage = result.success
-            ? `run_ollama succeeded. Decision: ${result.decision}. Commit: ${result.commitHash}. Diff:\n${result.diff}`
-            : `run_ollama failed after ${result.attempts} attempts: ${result.error}`;
+          steps.push({
+            step: stepNumber,
+            tool: 'run_ollama',
+            filePath: toolCall.filePath,
+            instruction: toolCall.instruction,
+            success: result.success,
+            commitHash: result.commitHash,
+            error: result.error,
+          });
 
-          steps.push({ step: stepNumber, tool: 'run_ollama', success: result.success, summary: toolResultMessage });
-          messages.push({ role: 'assistant', content: responseText });
-          messages.push({ role: 'user', content: toolResultMessage });
+          const ollamaResult = result.success
+            ? `run_ollama succeeded for ${toolCall.filePath}. Decision: ${result.decision}. Commit: ${result.commitHash}.\nDiff:\n${result.diff ?? ''}`.slice(0, CAP_OLLAMA_RESULT)
+            : `run_ollama failed for ${toolCall.filePath} after ${result.attempts} attempts: ${result.error}`;
+
+          recentResults.push(ollamaResult);
+          if (recentResults.length > RECENT_RESULTS_MAX) recentResults.shift();
+
+          consecutiveFailures = result.success ? 0 : consecutiveFailures + 1;
           continue;
         }
 
@@ -290,40 +325,47 @@ export function createGeminiDriver(pool, options = {}) {
         if (toolName === 'run_shell') {
           onProgress?.(`⚙️ Step ${stepNumber}: running shell\n\`${(toolCall.command ?? '').slice(0, 120)}\`\nTask: ${task.title} (${shortId})`);
           const shellCwd = path.resolve(task.project_path ?? workspaceRoot, toolCall.cwd ?? '.');
-          let toolResultMessage;
+          let succeeded = false;
+
+          let shellResult;
           try {
             const { stdout, stderr } = await execFileAsync('sh', ['-c', toolCall.command ?? 'true'], {
               cwd: shellCwd,
               timeout: 60_000,
               maxBuffer: 100_000,
             });
-            const output = [stdout, stderr].filter(Boolean).join('\n').slice(0, 3000);
-            toolResultMessage = `run_shell succeeded.\n${output || '(no output)'}`;
-            steps.push({ step: stepNumber, tool: 'run_shell', success: true });
+            const output = [stdout, stderr].filter(Boolean).join('\n').slice(0, CAP_SHELL_RESULT);
+            shellResult = `run_shell succeeded.\n${output || '(no output)'}`;
+            succeeded = true;
           } catch (error) {
-            const output = [error.stdout, error.stderr].filter(Boolean).join('\n').slice(0, 3000);
-            toolResultMessage = `run_shell failed (exit ${error.code ?? 'unknown'}).\n${output || error.message}`;
-            steps.push({ step: stepNumber, tool: 'run_shell', success: false });
+            const output = [error.stdout, error.stderr].filter(Boolean).join('\n').slice(0, CAP_SHELL_RESULT);
+            shellResult = `run_shell failed (exit ${error.code ?? 'unknown'}).\n${output || error.message}`;
           }
-          messages.push({ role: 'assistant', content: responseText });
-          messages.push({ role: 'user', content: toolResultMessage });
+
+          recentResults.push(shellResult);
+          if (recentResults.length > RECENT_RESULTS_MAX) recentResults.shift();
+
+          steps.push({
+            step: stepNumber,
+            tool: 'run_shell',
+            command: toolCall.command,
+            success: succeeded,
+          });
+
+          consecutiveFailures = succeeded ? 0 : consecutiveFailures + 1;
           continue;
         }
 
         // --- Tool: plan ---
         if (toolName === 'plan') {
           if (planAlreadyCalled) {
-            messages.push({ role: 'assistant', content: responseText });
-            messages.push({
-              role: 'user',
-              content: 'plan already called — you can only plan once.',
-            });
+            recentResults.push('plan already called — you can only plan once.');
+            if (recentResults.length > RECENT_RESULTS_MAX) recentResults.shift();
             continue;
           }
 
           planAlreadyCalled = true;
 
-          // Support both new "tasks" format and legacy "phases" format
           const rawItems = Array.isArray(toolCall.tasks)
             ? toolCall.tasks
             : Array.isArray(toolCall.phases)
@@ -332,12 +374,10 @@ export function createGeminiDriver(pool, options = {}) {
 
           const client = await pool.connect();
 
-          // Returns step_budget for a given task_type
           function budgetForType(taskType) {
             return STEP_BUDGET_BY_TYPE[taskType] ?? 15;
           }
 
-          // Recursively inserts a task and its children. Returns the inserted id.
           async function insertTaskTree(itemData, parentId, parentDepth, sequencePreviousId) {
             const title = String(itemData.title ?? '').trim();
             const description = String(itemData.description ?? '').trim();
@@ -348,12 +388,11 @@ export function createGeminiDriver(pool, options = {}) {
             const isParent = children.length > 0;
             const depth = parentDepth + 1;
 
-            // Parent tasks (those with children) wait for their children
             const initialStatus = isParent ? 'waiting_children' : 'pending';
-            // Parent tasks are coordinators by nature
-            const effectiveType = isParent && !['epic', 'story', 'task', 'coordinator'].includes(taskType)
-              ? 'task'
-              : taskType;
+            const effectiveType =
+              isParent && !['epic', 'story', 'task', 'coordinator'].includes(taskType)
+                ? 'task'
+                : taskType;
             const budget = isParent ? 0 : budgetForType(effectiveType);
 
             const fullDescription = acceptanceCriteria
@@ -386,7 +425,6 @@ export function createGeminiDriver(pool, options = {}) {
 
             const insertedId = insert.rows[0]?.id ?? null;
 
-            // Insert children sequentially (each depends on the previous sibling)
             if (isParent && insertedId) {
               let prevChildId = null;
               for (const child of children) {
@@ -404,9 +442,7 @@ export function createGeminiDriver(pool, options = {}) {
             let insertedCount = 0;
 
             for (const item of rawItems) {
-              if (!item.title) {
-                throw new Error('plan task is missing a title');
-              }
+              if (!item.title) throw new Error('plan task is missing a title');
               previousId = await insertTaskTree(item, task.id, task.depth ?? 0, previousId);
               insertedCount += 1;
             }
@@ -434,7 +470,7 @@ export function createGeminiDriver(pool, options = {}) {
           } catch (error) {
             await client.query('ROLLBACK').catch(() => {});
             lastError = error?.message ?? 'plan tool failed';
-            steps.push({ step: stepNumber, tool: 'plan', success: false, reason: lastError });
+            steps.push({ step: stepNumber, tool: 'plan', success: false });
             break;
           } finally {
             client.release();
@@ -444,15 +480,14 @@ export function createGeminiDriver(pool, options = {}) {
         // --- Tool: ask_human ---
         if (toolName === 'ask_human') {
           onProgress?.(`🙋 Step ${stepNumber}: asking for your input\n${toolCall.question ?? ''}\nTask: ${task.title} (${shortId})`);
-          // Check if human is actually online before delegating
           const presence = await computePresenceScore(pool, workspaceRoot).catch(() => ({ score: 0 }));
           const online = isHumanOnline(presence.score);
 
           if (!online) {
-            const skipMessage = `ask_human skipped: human not online (score: ${presence.score.toFixed(2)}). Continuing autonomously.`;
-            messages.push({ role: 'assistant', content: responseText });
-            messages.push({ role: 'user', content: skipMessage });
-            steps.push({ step: stepNumber, tool: 'ask_human', skipped: true, reason: skipMessage });
+            const skipMsg = `ask_human skipped: human not online (score: ${presence.score.toFixed(2)}). Continuing autonomously.`;
+            steps.push({ step: stepNumber, tool: 'ask_human', skipped: true });
+            recentResults.push(skipMsg);
+            if (recentResults.length > RECENT_RESULTS_MAX) recentResults.shift();
             continue;
           }
 
@@ -463,13 +498,18 @@ export function createGeminiDriver(pool, options = {}) {
             timeoutMinutes: 60,
           });
 
-          const humanMessage = delegationResult.completed
-            ? `Human completed the step. New commit: ${delegationResult.newCommitHash}`
-            : `Human delegation timed out after 60 minutes.`;
+          steps.push({
+            step: stepNumber,
+            tool: 'ask_human',
+            completed: delegationResult.completed,
+          });
 
-          steps.push({ step: stepNumber, tool: 'ask_human', completed: delegationResult.completed, summary: humanMessage });
-          messages.push({ role: 'assistant', content: responseText });
-          messages.push({ role: 'user', content: humanMessage });
+          recentResults.push(
+            delegationResult.completed
+              ? `Human completed the step. New commit: ${delegationResult.newCommitHash}`
+              : `Human delegation timed out after 60 minutes.`
+          );
+          if (recentResults.length > RECENT_RESULTS_MAX) recentResults.shift();
           continue;
         }
 
@@ -480,8 +520,15 @@ export function createGeminiDriver(pool, options = {}) {
 
       const hitBudget = maxSteps > 0 && stepNumber >= maxSteps && !taskSucceeded && !lastError;
       if (hitBudget) {
-        // Graceful replan — not a hard failure
-        const completedSummary = steps.map((s) => s.summary ?? s.tool).filter(Boolean).join('; ');
+        const completedSummary = steps
+          .map((s) =>
+            s.tool === 'run_ollama'
+              ? `wrote ${s.filePath}`
+              : s.tool === 'run_shell'
+                ? `ran shell`
+                : s.tool
+          )
+          .join(', ');
         return {
           success: false,
           needsReplan: true,
@@ -491,13 +538,19 @@ export function createGeminiDriver(pool, options = {}) {
         };
       }
 
+      const orchestratorModel = usedEscalation
+        ? config.geminiEscalationModel
+        : usedOllamaFallback
+          ? config.ollamaModelOrchestrator
+          : config.geminiStepModel;
+
       await pool.query(
         `UPDATE tasks
          SET orchestrator_model = $1,
              gemini_review_status = $2
          WHERE id = $3`,
         [
-          usedOllamaFallback ? config.ollamaModelOrchestrator : config.geminiDefaultModel,
+          orchestratorModel,
           usedOllamaFallback ? 'pending' : null,
           task.id,
         ]
@@ -505,11 +558,7 @@ export function createGeminiDriver(pool, options = {}) {
 
       const driverResult = taskSucceeded
         ? { success: true, stepsCompleted: stepNumber, error: null }
-        : {
-            success: false,
-            stepsCompleted: stepNumber,
-            error: lastError ?? 'unknown error',
-          };
+        : { success: false, stepsCompleted: stepNumber, error: lastError ?? 'unknown error' };
 
       if (learningExtractor) {
         try {
@@ -522,24 +571,16 @@ export function createGeminiDriver(pool, options = {}) {
 
           if (learnings.length > 0 && skillGenerator) {
             const topCategory = [...learnings].sort(
-              (left, right) => right.confidenceScore - left.confidenceScore
+              (a, b) => b.confidenceScore - a.confidenceScore
             )[0]?.category;
 
             if (topCategory) {
-              // Always query DB (which already has current task's learnings persisted) so the
-              // cluster includes historical learnings across all tasks, not just this one.
               const generationResult = await skillGenerator.checkAndGenerate(topCategory);
-
-              if (generationResult.generated) {
-                await skillGenerator.syncToDatabase();
-              }
+              if (generationResult.generated) await skillGenerator.syncToDatabase();
             }
           }
         } catch (hookError) {
-          console.warn(
-            '[geminiDriver] post-task hook failed (non-fatal):',
-            hookError?.message ?? hookError
-          );
+          console.warn('[geminiDriver] post-task hook failed (non-fatal):', hookError?.message ?? hookError);
         }
       }
 
